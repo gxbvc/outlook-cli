@@ -1,0 +1,145 @@
+import { Command } from "commander";
+import { graphRequest, out, err } from "../graph.js";
+
+export function registerDrafts(program: Command) {
+  const drafts = program.command("drafts").description("Manage drafts");
+
+  drafts
+    .command("list")
+    .description("List drafts")
+    .option("--limit <n>", "Max results", "25")
+    .option("--page-token <token>", "Pagination token")
+    .action(async (opts) => {
+      try {
+        let url: string;
+        if (opts.pageToken) {
+          url = opts.pageToken;
+        } else {
+          const params = new URLSearchParams({ "$top": opts.limit });
+          params.append("$select", "id,subject,toRecipients,createdDateTime,bodyPreview");
+          params.append("$orderby", "createdDateTime desc");
+          url = `/me/mailFolders/drafts/messages?${params.toString()}`;
+        }
+        const data = await graphRequest(url);
+        out({
+          drafts: data.value,
+          nextPage: data["@odata.nextLink"] || null,
+          count: data.value.length,
+        });
+      } catch (e: any) { err(e.message, "LIST_FAILED"); }
+    });
+
+  drafts
+    .command("create")
+    .description("Create a new draft")
+    .requiredOption("--to <addresses>", "Comma-separated recipients")
+    .requiredOption("--subject <subject>", "Subject line")
+    .option("--text <text>", "Plain text body")
+    .option("--html <html>", "HTML body")
+    .option("--cc <addresses>", "Comma-separated CC")
+    .option("--bcc <addresses>", "Comma-separated BCC")
+    .action(async (opts) => {
+      try {
+        const body: any = {
+          subject: opts.subject,
+          body: {
+            contentType: opts.html ? "HTML" : "Text",
+            content: opts.html || opts.text || "",
+          },
+          toRecipients: opts.to.split(",").map((e: string) => ({
+            emailAddress: { address: e.trim() },
+          })),
+        };
+        if (opts.cc) {
+          body.ccRecipients = opts.cc.split(",").map((e: string) => ({
+            emailAddress: { address: e.trim() },
+          }));
+        }
+        if (opts.bcc) {
+          body.bccRecipients = opts.bcc.split(",").map((e: string) => ({
+            emailAddress: { address: e.trim() },
+          }));
+        }
+        const data = await graphRequest("/me/messages", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        out(data);
+      } catch (e: any) { err(e.message, "CREATE_FAILED"); }
+    });
+
+  drafts
+    .command("reply")
+    .description("Create a reply draft")
+    .requiredOption("--id <id>", "Message ID to reply to")
+    .option("--text <text>", "Plain text body")
+    .option("--html <html>", "HTML body")
+    .option("--reply-all", "Reply to all")
+    .action(async (opts) => {
+      try {
+        const endpoint = opts.replyAll ? "createReplyAll" : "createReply";
+        const body: any = {};
+        if (opts.text || opts.html) {
+          body.comment = opts.html || opts.text;
+        }
+        const data = await graphRequest(`/me/messages/${opts.id}/${endpoint}`, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        out(data);
+      } catch (e: any) { err(e.message, "REPLY_DRAFT_FAILED"); }
+    });
+
+  drafts
+    .command("update")
+    .description("Update a draft")
+    .requiredOption("--id <id>", "Draft message ID")
+    .option("--to <addresses>", "Comma-separated recipients")
+    .option("--subject <subject>", "Subject line")
+    .option("--text <text>", "Plain text body")
+    .option("--html <html>", "HTML body")
+    .action(async (opts) => {
+      try {
+        const body: any = {};
+        if (opts.subject) body.subject = opts.subject;
+        if (opts.text || opts.html) {
+          body.body = {
+            contentType: opts.html ? "HTML" : "Text",
+            content: opts.html || opts.text,
+          };
+        }
+        if (opts.to) {
+          body.toRecipients = opts.to.split(",").map((e: string) => ({
+            emailAddress: { address: e.trim() },
+          }));
+        }
+        const data = await graphRequest(`/me/messages/${opts.id}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        });
+        out(data);
+      } catch (e: any) { err(e.message, "UPDATE_FAILED"); }
+    });
+
+  drafts
+    .command("send")
+    .description("Send a draft")
+    .requiredOption("--id <id>", "Draft message ID")
+    .action(async (opts) => {
+      try {
+        await graphRequest(`/me/messages/${opts.id}/send`, { method: "POST" });
+        out({ message: "Draft sent" });
+      } catch (e: any) { err(e.message, "SEND_FAILED"); }
+    });
+
+  drafts
+    .command("delete")
+    .description("Delete a draft")
+    .requiredOption("--id <id>", "Draft message ID")
+    .action(async (opts) => {
+      try {
+        await graphRequest(`/me/messages/${opts.id}`, { method: "DELETE" });
+        out({ message: "Draft deleted" });
+      } catch (e: any) { err(e.message, "DELETE_FAILED"); }
+    });
+}

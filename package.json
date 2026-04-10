@@ -1,0 +1,22 @@
+{
+  "name": "outlook-cli",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "outlook-cli": "./bin/outlook-cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "auth": "tsx src/auth.ts"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0",
+    "@types/node": "^20.11.0"
+  }
+}
