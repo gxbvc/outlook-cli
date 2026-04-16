@@ -18,18 +18,22 @@ outlook-cli me                                      # Get current user profile
 # Emails
 outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filter "..."]
 outlook-cli emails get --id MESSAGE_ID
-outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."]
-outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all]
+outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]
+outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all] [--attach PATH ...]
 outlook-cli emails move --id MESSAGE_ID --folder FOLDER_ID
 outlook-cli emails delete --id MESSAGE_ID
 outlook-cli emails read --id MESSAGE_ID              # Mark as read
 outlook-cli emails unread --id MESSAGE_ID            # Mark as unread
+outlook-cli emails attachments --id MESSAGE_ID       # List attachments
+outlook-cli emails download --id MESSAGE_ID [--attachment-id ATT_ID] [--out PATH]
 
 # Drafts
 outlook-cli drafts list [--limit 25]
-outlook-cli drafts create --to "a@b.com" --subject "Hi" [--text "body"] [--html "..."]
-outlook-cli drafts reply --id MESSAGE_ID [--text "reply"] [--reply-all]
-outlook-cli drafts update --id DRAFT_ID [--to "..."] [--subject "..."] [--text "..."]
+outlook-cli drafts create --to "a@b.com" --subject "Hi" [--text "body"] [--html "..."] [--cc "..."] [--bcc "..."] [--attach PATH ...]
+outlook-cli drafts reply --id MESSAGE_ID [--text "reply"] [--reply-all] [--attach PATH ...]
+outlook-cli drafts update --id DRAFT_ID [--to "..."] [--subject "..."] [--text "..."] [--cc "..."] [--bcc "..."] [--attach PATH ...]
+outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]
+outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID
 outlook-cli drafts send --id DRAFT_ID
 outlook-cli drafts delete --id DRAFT_ID
 
@@ -47,6 +51,34 @@ outlook-cli emails reply --id AAMkAG... --text "Thanks!"
 outlook-cli drafts create --to "alice@example.com" --subject "Draft" --text "WIP"
 outlook-cli drafts send --id AAMkAG...
 ```
+
+## Attachments
+
+Send messages with attachments by repeating `--attach` (or `--file` for `drafts attach`). Files ≤ 3 MiB are inlined into the request; larger files transparently use Graph's upload sessions via a draft → chunked PUT → send flow.
+
+```bash
+# Send with attachments (inline if small, upload session if any > 3 MiB)
+outlook-cli emails send --to a@b.com --subject "Hi" --html "<p>Body</p>" \
+  --attach ./report.pdf --attach ./chart.png
+
+# Reply with an attachment
+outlook-cli emails reply --id MSG_ID --html "<p>see attached</p>" --attach ./notes.md
+
+# Create a draft with attachments (works for any size)
+outlook-cli drafts create --to a@b.com --subject "Hi" --attach ./big.zip
+
+# Reply draft with attachments (does not auto-send)
+outlook-cli drafts reply --id MSG_ID --html "<p>Draft reply</p>" --attach ./a.pdf
+
+# Update a draft (supports --cc / --bcc / --attach)
+outlook-cli drafts update --id DRAFT_ID --cc "extra@b.com" --attach ./extra.pdf
+
+# Add or remove attachments on an existing draft
+outlook-cli drafts attach --id DRAFT_ID --file ./extra.pdf --file ./more.png
+outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID
+```
+
+Inline threshold: `3 MiB` (Graph's file-attachment payload ceiling). Anything larger automatically switches to the `createUploadSession` flow in 5 MiB chunks. No user action required.
 
 ## Response Format
 

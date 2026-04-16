@@ -40,8 +40,8 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 ### Emails
 - `outlook-cli emails list` — List inbox emails
 - `outlook-cli emails get --id ID` — Get full email
-- `outlook-cli emails send --to ADDR --subject SUBJ --text BODY` — Send email
-- `outlook-cli emails reply --id ID --text BODY` — Reply to email
+- `outlook-cli emails send --to ADDR --subject SUBJ --text BODY [--attach PATH ...]` — Send email
+- `outlook-cli emails reply --id ID --text BODY [--attach PATH ...]` — Reply to email
 - `outlook-cli emails move --id ID --folder FOLDER_ID` — Move email
 - `outlook-cli emails delete --id ID` — Delete email
 - `outlook-cli emails read --id ID` — Mark as read
@@ -51,9 +51,11 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 
 ### Drafts
 - `outlook-cli drafts list` — List drafts
-- `outlook-cli drafts create --to ADDR --subject SUBJ --text BODY` — Create draft
-- `outlook-cli drafts reply --id ID` — Create reply draft
-- `outlook-cli drafts update --id ID --subject SUBJ` — Update draft
+- `outlook-cli drafts create --to ADDR --subject SUBJ --text BODY [--cc ...] [--bcc ...] [--attach PATH ...]` — Create draft
+- `outlook-cli drafts reply --id ID [--attach PATH ...]` — Create reply draft
+- `outlook-cli drafts update --id ID [--subject SUBJ] [--cc ...] [--bcc ...] [--attach PATH ...]` — Update draft
+- `outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]` — Attach file(s) to a draft
+- `outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID` — Remove an attachment from a draft
 - `outlook-cli drafts send --id ID` — Send draft
 - `outlook-cli drafts delete --id ID` — Delete draft
 
@@ -68,6 +70,21 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
   outlook-cli drafts create --to "someone@example.com" --subject "Hello" \
     --html '<p>Hi there,</p><p>Here is my message.</p><p>Thanks!</p>'
   ```
+
+## Attachments
+
+Repeat `--attach PATH` to attach files. Files ≤ 3 MiB are inlined into the request; larger files are transparently uploaded via Graph's `createUploadSession` flow in 5 MiB chunks. Works for `emails send`, `emails reply`, `drafts create`, `drafts reply`, and `drafts update`. You can also manage attachments on an existing draft directly:
+
+```bash
+outlook-cli emails send --to a@b.com --subject Hi --html "<p>Body</p>" \
+  --attach ./report.pdf --attach ./chart.png
+
+outlook-cli emails reply --id MSG_ID --html "<p>see attached</p>" --attach ./notes.md
+
+outlook-cli drafts create --to a@b.com --subject Hi --attach ./big.zip
+outlook-cli drafts attach --id DRAFT_ID --file ./extra.pdf
+outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID
+```
 
 ## Output Format
 

@@ -1,7 +1,16 @@
 import { Command } from "commander";
-import { writeFileSync, mkdirSync } from "fs";
+import { writeFileSync, mkdirSync, existsSync, statSync } from "fs";
 import { join, resolve } from "path";
 import { graphRequest, out, err } from "../graph.js";
+import {
+  loadAll,
+  hasLarge,
+  toFileAttachmentJson,
+  attachAllToDraft,
+  INLINE_LIMIT_BYTES,
+} from "../attachments.js";
+
+const collect = (v: string, acc: string[]) => { acc.push(v); return acc; };
 
 export function registerEmails(program: Command) {
   const emails = program.command("emails").description("Manage emails");
@@ -57,36 +66,87 @@ export function registerEmails(program: Command) {
     .option("--html <html>", "HTML body")
     .option("--cc <addresses>", "Comma-separated CC")
     .option("--bcc <addresses>", "Comma-separated BCC")
+    .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
       try {
         const toRecipients = opts.to.split(",").map((e: string) => ({
           emailAddress: { address: e.trim() },
         }));
-        const body: any = {
-          message: {
+        const ccRecipients = opts.cc
+          ? opts.cc.split(",").map((e: string) => ({ emailAddress: { address: e.trim() } }))
+          : undefined;
+        const bccRecipients = opts.bcc
+          ? opts.bcc.split(",").map((e: string) => ({ emailAddress: { address: e.trim() } }))
+          : undefined;
+
+        const attachPaths: string[] = opts.attach || [];
+
+        if (attachPaths.length === 0 || !hasLarge(attachPaths)) {
+          // All small: single /me/sendMail call with inline attachments
+          const message: any = {
             subject: opts.subject,
             body: {
               contentType: opts.html ? "HTML" : "Text",
               content: opts.html || opts.text || "",
             },
             toRecipients,
+          };
+          if (ccRecipients) message.ccRecipients = ccRecipients;
+          if (bccRecipients) message.bccRecipients = bccRecipients;
+
+          const attSummary: { name: string; size: number }[] = [];
+          if (attachPaths.length > 0) {
+            const loaded = loadAll(attachPaths);
+            message.attachments = loaded.map(toFileAttachmentJson);
+            for (const a of loaded) attSummary.push({ name: a.name, size: a.size });
+          }
+
+          await graphRequest("/me/sendMail", {
+            method: "POST",
+            body: JSON.stringify({ message }),
+          });
+
+          out(attachPaths.length > 0
+            ? { message: "Email sent", attachments: attSummary }
+            : { message: "Email sent" });
+          return;
+        }
+
+        // Large attachments present: create draft, attach, send
+        const draftBody: any = {
+          subject: opts.subject,
+          body: {
+            contentType: opts.html ? "HTML" : "Text",
+            content: opts.html || opts.text || "",
           },
+          toRecipients,
         };
-        if (opts.cc) {
-          body.message.ccRecipients = opts.cc.split(",").map((e: string) => ({
-            emailAddress: { address: e.trim() },
-          }));
+        if (ccRecipients) draftBody.ccRecipients = ccRecipients;
+        if (bccRecipients) draftBody.bccRecipients = bccRecipients;
+
+        // Inline-attach all small ones at draft creation
+        const loaded = loadAll(attachPaths);
+        const smallInline = loaded.filter((a) => a.size <= INLINE_LIMIT_BYTES);
+        const largeRemaining = loaded.filter((a) => a.size > INLINE_LIMIT_BYTES);
+        if (smallInline.length > 0) {
+          draftBody.attachments = smallInline.map(toFileAttachmentJson);
         }
-        if (opts.bcc) {
-          body.message.bccRecipients = opts.bcc.split(",").map((e: string) => ({
-            emailAddress: { address: e.trim() },
-          }));
-        }
-        await graphRequest("/me/sendMail", {
+
+        const draft = await graphRequest("/me/messages", {
           method: "POST",
-          body: JSON.stringify(body),
+          body: JSON.stringify(draftBody),
         });
-        out({ message: "Email sent" });
+
+        for (const a of largeRemaining) {
+          await attachAllToDraft(draft.id, [a.path]);
+        }
+
+        await graphRequest(`/me/messages/${draft.id}/send`, { method: "POST" });
+
+        out({
+          message: "Email sent",
+          attachments: loaded.map((a) => ({ name: a.name, size: a.size })),
+        });
       } catch (e: any) { err(e.message, "SEND_FAILED"); }
     });
 
@@ -97,16 +157,34 @@ export function registerEmails(program: Command) {
     .option("--text <text>", "Plain text reply")
     .option("--html <html>", "HTML reply")
     .option("--reply-all", "Reply to all recipients")
+    .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
       try {
-        const endpoint = opts.replyAll ? "replyAll" : "reply";
-        await graphRequest(`/me/messages/${opts.id}/${endpoint}`, {
+        const attachPaths: string[] = opts.attach || [];
+
+        if (attachPaths.length === 0) {
+          const endpoint = opts.replyAll ? "replyAll" : "reply";
+          await graphRequest(`/me/messages/${opts.id}/${endpoint}`, {
+            method: "POST",
+            body: JSON.stringify({
+              comment: opts.html || opts.text || "",
+            }),
+          });
+          out({ message: `Reply sent` });
+          return;
+        }
+
+        // Attachments: createReply(All) → attach files → send
+        const createEndpoint = opts.replyAll ? "createReplyAll" : "createReply";
+        const draft = await graphRequest(`/me/messages/${opts.id}/${createEndpoint}`, {
           method: "POST",
-          body: JSON.stringify({
-            comment: opts.html || opts.text || "",
-          }),
+          body: JSON.stringify({ comment: opts.html || opts.text || "" }),
         });
-        out({ message: `Reply sent` });
+
+        const attached = await attachAllToDraft(draft.id, attachPaths);
+        await graphRequest(`/me/messages/${draft.id}/send`, { method: "POST" });
+
+        out({ message: "Reply sent", attachments: attached.map((a) => ({ name: a.name, size: a.size })) });
       } catch (e: any) { err(e.message, "REPLY_FAILED"); }
     });
 
@@ -192,39 +270,59 @@ export function registerEmails(program: Command) {
     .action(async (opts) => {
       try {
         const outPath = resolve(opts.out);
-        let attachments: any[];
+        let rawAttachments: any[];
 
         if (opts.attachmentId) {
           const att = await graphRequest(`/me/messages/${opts.id}/attachments/${opts.attachmentId}`);
-          attachments = [att];
+          rawAttachments = [att];
         } else {
           const data = await graphRequest(`/me/messages/${opts.id}/attachments`);
-          attachments = data.value.filter((a: any) => a["@odata.type"] === "#microsoft.graph.fileAttachment");
+          rawAttachments = data.value;
         }
 
-        if (attachments.length === 0) {
-          out({ files: [], message: "No file attachments found" });
+        const fileAttachments = rawAttachments.filter(
+          (a: any) => a["@odata.type"] === "#microsoft.graph.fileAttachment"
+        );
+        const skipped = rawAttachments
+          .filter((a: any) => a["@odata.type"] !== "#microsoft.graph.fileAttachment")
+          .map((a: any) => ({
+            name: a.name,
+            type: a["@odata.type"],
+            reason: a["@odata.type"] === "#microsoft.graph.itemAttachment"
+              ? "item attachment (nested message/event) — use a different endpoint to retrieve"
+              : a["@odata.type"] === "#microsoft.graph.referenceAttachment"
+                ? "reference attachment (cloud link) — open the sourceUrl directly"
+                : "unsupported attachment type",
+          }));
+
+        if (fileAttachments.length === 0) {
+          out({ files: [], skipped, message: "No file attachments found" });
           return;
         }
 
+        const treatAsDir =
+          fileAttachments.length > 1 ||
+          opts.out === "." ||
+          opts.out.endsWith("/") ||
+          (existsSync(outPath) && statSync(outPath).isDirectory());
+
         const saved: any[] = [];
-        for (const att of attachments) {
+        for (const att of fileAttachments) {
           const buf = Buffer.from(att.contentBytes, "base64");
           let filePath: string;
 
-          if (attachments.length === 1 && !outPath.endsWith("/") && opts.out !== ".") {
-            // Single attachment + --out looks like a file path
-            filePath = outPath;
-          } else {
+          if (treatAsDir) {
             mkdirSync(outPath, { recursive: true });
             filePath = join(outPath, att.name);
+          } else {
+            filePath = outPath;
           }
 
           writeFileSync(filePath, buf);
           saved.push({ file: filePath, name: att.name, bytes: buf.length });
         }
 
-        out({ files: saved, count: saved.length });
+        out({ files: saved, count: saved.length, skipped });
       } catch (e: any) { err(e.message, "DOWNLOAD_FAILED"); }
     });
 }
