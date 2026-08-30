@@ -25,7 +25,7 @@ outlook-cli emails delete --id MESSAGE_ID
 outlook-cli emails read --id MESSAGE_ID              # Mark as read
 outlook-cli emails unread --id MESSAGE_ID            # Mark as unread
 outlook-cli emails attachments --id MESSAGE_ID       # List attachments
-outlook-cli emails download --id MESSAGE_ID [--attachment-id ATT_ID] [--out PATH]
+outlook-cli emails download --id MESSAGE_ID [--attachment-id ATT_ID] [--out PATH]  # also pulls file attachments nested inside forwarded itemAttachment messages
 
 # Drafts
 outlook-cli drafts list [--limit 25]

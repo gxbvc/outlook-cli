@@ -283,17 +283,42 @@ export function registerEmails(program: Command) {
         const fileAttachments = rawAttachments.filter(
           (a: any) => a["@odata.type"] === "#microsoft.graph.fileAttachment"
         );
-        const skipped = rawAttachments
-          .filter((a: any) => a["@odata.type"] !== "#microsoft.graph.fileAttachment")
+        const skipped: any[] = rawAttachments
+          .filter((a: any) =>
+            a["@odata.type"] !== "#microsoft.graph.fileAttachment" &&
+            a["@odata.type"] !== "#microsoft.graph.itemAttachment"
+          )
           .map((a: any) => ({
             name: a.name,
             type: a["@odata.type"],
-            reason: a["@odata.type"] === "#microsoft.graph.itemAttachment"
-              ? "item attachment (nested message/event) — use a different endpoint to retrieve"
-              : a["@odata.type"] === "#microsoft.graph.referenceAttachment"
-                ? "reference attachment (cloud link) — open the sourceUrl directly"
-                : "unsupported attachment type",
+            reason: "reference attachment (cloud link) — open the sourceUrl directly",
           }));
+
+        // itemAttachment = forwarded message/event/contact nested inside the mail item.
+        // Its own file attachments only come back via a nested $expand, not the flat list.
+        const itemAttachments = rawAttachments.filter(
+          (a: any) => a["@odata.type"] === "#microsoft.graph.itemAttachment"
+        );
+        for (const item of itemAttachments) {
+          const expanded = await graphRequest(
+            `/me/messages/${opts.id}/attachments/${item.id}?$expand=microsoft.graph.itemAttachment/item`
+          );
+          const nested = (expanded.item?.attachments || []).filter(
+            (a: any) => a["@odata.type"] === "#microsoft.graph.fileAttachment"
+          );
+          if (nested.length === 0) {
+            skipped.push({
+              name: item.name,
+              type: item["@odata.type"],
+              reason: "nested item has no file attachments to extract",
+            });
+            continue;
+          }
+          const safeItemName = item.name.replace(/[\/\\]/g, "-");
+          for (const n of nested) {
+            fileAttachments.push({ ...n, name: `${safeItemName} - ${n.name}` });
+          }
+        }
 
         if (fileAttachments.length === 0) {
           out({ files: [], skipped, message: "No file attachments found" });
