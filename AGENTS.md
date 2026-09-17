@@ -16,7 +16,7 @@ outlook-cli auth                                    # Authenticate (browser OAut
 outlook-cli me                                      # Get current user profile
 
 # Emails
-outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filter "..."]
+outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filter "..."] [--user EMAIL]
 outlook-cli emails get --id MESSAGE_ID
 outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]
 outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all] [--attach PATH ...]
@@ -36,19 +36,31 @@ outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]
 outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID
 outlook-cli drafts send --id DRAFT_ID
 outlook-cli drafts delete --id DRAFT_ID
+outlook-cli drafts url --id DRAFT_ID                 # OWA browser URL that opens the draft
 
 # Folders
 outlook-cli folders list
 outlook-cli folders create --name "My Folder" [--parent PARENT_ID]
+
+# Calendar (timezone defaults to OUTLOOK_DEFAULT_TZ; falls back to America/Chicago)
+outlook-cli calendar list [--today] [--start ISO] [--end ISO] [--limit 50] [--search "query"] [--tz "America/Chicago"]
+outlook-cli calendar get --id EVENT_ID [--tz TZ]
+outlook-cli calendar create --subject "..." --start ISO --end ISO [--tz TZ] [--location "..."] [--html "<p>...</p>" | --body "..."] [--attendees "a@b.com,c@d.com"] [--online] [--all-day]
+outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end ISO] [--tz TZ] [--location "..."] [--html "..." | --body "..."] [--attendees "..."]
+outlook-cli calendar delete --id EVENT_ID              # Silent — does not notify attendees
 ```
 
 ## Examples
 
 ```bash
 outlook-cli emails list --search "from:john@example.com" --limit 5
+outlook-cli --user charles@brenmere.com emails list --limit 5
 outlook-cli emails send --to "bob@example.com" --subject "Hello" --text "Hi Bob"
 outlook-cli emails reply --id AAMkAG... --text "Thanks!"
 outlook-cli drafts create --to "alice@example.com" --subject "Draft" --text "WIP"
+
+# Open a draft in the browser. `drafts create` returns the same link as `owaUrl`.
+open "$(outlook-cli drafts url --id AAMkAG... | jq -r .data.owaUrl)"
 outlook-cli drafts send --id AAMkAG...
 ```
 

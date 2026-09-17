@@ -243,6 +243,34 @@ export function registerEmails(program: Command) {
     });
 
   emails
+    .command("flag")
+    .description("Flag an email (equivalent to Gmail star)")
+    .requiredOption("--id <id>", "Message ID")
+    .action(async (opts) => {
+      try {
+        await graphRequest(`/me/messages/${opts.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ flag: { flagStatus: "flagged" } }),
+        });
+        out({ message: "Flagged" });
+      } catch (e: any) { err(e.message, "FLAG_FAILED"); }
+    });
+
+  emails
+    .command("unflag")
+    .description("Remove flag from an email")
+    .requiredOption("--id <id>", "Message ID")
+    .action(async (opts) => {
+      try {
+        await graphRequest(`/me/messages/${opts.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ flag: { flagStatus: "notFlagged" } }),
+        });
+        out({ message: "Unflagged" });
+      } catch (e: any) { err(e.message, "UNFLAG_FAILED"); }
+    });
+
+  emails
     .command("attachments")
     .description("List attachments on an email")
     .requiredOption("--id <id>", "Message ID")

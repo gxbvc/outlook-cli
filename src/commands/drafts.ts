@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { graphRequest, out, err } from "../graph.js";
+import { graphRequest, out, err, owaUrl } from "../graph.js";
 import {
   loadAll,
   hasLarge,
@@ -92,15 +92,30 @@ export function registerDrafts(program: Command) {
           await attachAllToDraft(data.id, largePaths);
         }
 
+        const link = await owaUrl(data.id);
         if (attachPaths.length > 0) {
           out({
             ...data,
+            owaUrl: link,
             attachments: loaded.map((a) => ({ name: a.name, size: a.size })),
           });
         } else {
-          out(data);
+          out({ ...data, owaUrl: link });
         }
       } catch (e: any) { err(e.message, "CREATE_FAILED"); }
+    });
+
+  drafts
+    .command("url")
+    .description("Print the OWA browser URL for a draft (open it with: open \"$(...)\")")
+    .requiredOption("--id <id>", "Draft ID")
+    .option("--folder <folder>", "OWA folder segment", "drafts")
+    .action(async (opts) => {
+      try {
+        const link = await owaUrl(opts.id, opts.folder);
+        if (!link) err("Could not translate that ID to an OWA URL", "NO_URL");
+        out({ id: opts.id, owaUrl: link });
+      } catch (e: any) { err(e.message, "URL_FAILED"); }
     });
 
   drafts

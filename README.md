@@ -5,7 +5,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 ## Prerequisites
 
 - Node.js 18+
-- An Azure AD app registration with Microsoft Graph permissions (Mail.Read, Mail.ReadWrite, Mail.Send, User.Read)
+- An Azure AD app registration with Microsoft Graph permissions (Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, User.Read)
 
 ## Setup
 
@@ -23,6 +23,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
    OUTLOOK_CLIENT_SECRET=your-client-secret
    OUTLOOK_TENANT_ID=your-tenant-id
    OUTLOOK_REDIRECT_URI=http://localhost:3000/callback
+   OUTLOOK_DEFAULT_TZ=America/Chicago
    ```
 
 3. Authenticate:
@@ -62,6 +63,15 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 ### Folders
 - `outlook-cli folders list` — List mail folders
 - `outlook-cli folders create --name NAME` — Create folder
+
+### Calendar
+- `outlook-cli calendar list [--today] [--start ISO] [--end ISO] [--limit N] [--search Q] [--tz TZ]` — List events
+- `outlook-cli calendar get --id EVENT_ID` — Get a single event
+- `outlook-cli calendar create --subject SUBJ --start ISO --end ISO [--tz TZ] [--location LOC] [--html HTML | --body TEXT] [--attendees "a@b.com,c@d.com"] [--online] [--all-day]` — Create event
+- `outlook-cli calendar update --id ID [--subject ...] [--start ...] [--end ...] [--location ...] [--html ...] [--attendees ...]` — Update event
+- `outlook-cli calendar delete --id ID` — Delete event (silent — attendees not notified)
+
+Timezone defaults to `OUTLOOK_DEFAULT_TZ` (`America/Chicago` if unset). Override per-call with `--tz`. `--today` uses start/end-of-day in the chosen timezone and expands recurrences via `/me/calendarView`.
 
 ## Tips
 

@@ -4,13 +4,19 @@ import { registerEmails } from "./commands/emails.js";
 import { registerDrafts } from "./commands/drafts.js";
 import { registerFolders } from "./commands/folders.js";
 import { registerMe } from "./commands/me.js";
+import { registerCalendar } from "./commands/calendar.js";
 
 const program = new Command();
 
 program
   .name("outlook-cli")
   .description("CLI for Microsoft Outlook via Graph API")
-  .version("1.0.0");
+  .version("1.0.0")
+  .option("--user <email>", "Act as this mailbox (shared mailbox / Send As)")
+  .hook("preAction", (_thisCommand, actionCommand) => {
+    const user = actionCommand.optsWithGlobals().user;
+    if (user) process.env.OUTLOOK_USER = user;
+  });
 
 program
   .command("auth")
@@ -28,5 +34,6 @@ registerEmails(program);
 registerDrafts(program);
 registerFolders(program);
 registerMe(program);
+registerCalendar(program);
 
 program.parse();
