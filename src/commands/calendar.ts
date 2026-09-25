@@ -253,4 +253,19 @@ export function registerCalendar(program: Command) {
         out({ message: "Event deleted" });
       } catch (e: any) { err(e.message, "DELETE_FAILED"); }
     });
+
+  calendar
+    .command("cancel")
+    .description("Cancel an event you organize and notify attendees (use an occurrence ID to cancel one instance of a series)")
+    .requiredOption("--id <id>", "Event ID")
+    .option("--comment <text>", "Message included in the cancellation notice")
+    .action(async (opts) => {
+      try {
+        await graphRequest(`/me/events/${opts.id}/cancel`, {
+          method: "POST",
+          body: JSON.stringify({ comment: opts.comment || "" }),
+        });
+        out({ message: "Event cancelled" });
+      } catch (e: any) { err(e.message, "CANCEL_FAILED"); }
+    });
 }

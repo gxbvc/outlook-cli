@@ -48,6 +48,7 @@ outlook-cli calendar get --id EVENT_ID [--tz TZ]
 outlook-cli calendar create --subject "..." --start ISO --end ISO [--tz TZ] [--location "..."] [--html "<p>...</p>" | --body "..."] [--attendees "a@b.com,c@d.com"] [--online] [--all-day]
 outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end ISO] [--tz TZ] [--location "..."] [--html "..." | --body "..."] [--attendees "..."]
 outlook-cli calendar delete --id EVENT_ID              # Silent — does not notify attendees
+outlook-cli calendar cancel --id EVENT_ID [--comment "..."]  # Organizer only; sends cancellation to attendees. Occurrence ID cancels one instance
 ```
 
 ## Examples
