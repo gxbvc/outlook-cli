@@ -35,6 +35,7 @@ outlook-cli drafts update --id DRAFT_ID [--to "..."] [--subject "..."] [--text "
 outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]
 outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID
 outlook-cli drafts send --id DRAFT_ID
+outlook-cli drafts send --id DRAFT_ID --at 2026-09-28T08:30:00-05:00  # Exchange sends it then; the draft keeps its id until then, so drafts delete cancels it
 outlook-cli drafts delete --id DRAFT_ID
 outlook-cli drafts url --id DRAFT_ID                 # OWA browser URL that opens the draft
 

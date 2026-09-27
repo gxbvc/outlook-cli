@@ -203,8 +203,25 @@ export function registerDrafts(program: Command) {
     .command("send")
     .description("Send a draft")
     .requiredOption("--id <id>", "Draft message ID")
+    .option("--at <time>", "Schedule: ISO time with offset, e.g. 2026-09-28T08:30:00-05:00. Exchange holds it in Outbox until then.")
     .action(async (opts) => {
       try {
+        if (opts.at) {
+          const at = new Date(opts.at);
+          if (isNaN(at.getTime())) err(`--at is not a valid time: ${opts.at}`, "USAGE");
+          if (at.getTime() <= Date.now()) err(`--at is in the past: ${opts.at}`, "USAGE");
+          // PR_DEFERRED_SEND_TIME: Exchange keeps the sent message in Outbox and
+          // delivers it at this time, even when no client is running.
+          await graphRequest(`/me/messages/${opts.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              singleValueExtendedProperties: [{ id: "SystemTime 0x3FEF", value: at.toISOString() }],
+            }),
+          });
+          await graphRequest(`/me/messages/${opts.id}/send`, { method: "POST" });
+          out({ message: "Draft scheduled", sendAt: at.toISOString() });
+          return;
+        }
         await graphRequest(`/me/messages/${opts.id}/send`, { method: "POST" });
         out({ message: "Draft sent" });
       } catch (e: any) { err(e.message, "SEND_FAILED"); }

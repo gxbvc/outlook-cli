@@ -58,6 +58,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 - `outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]` — Attach file(s) to a draft
 - `outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID` — Remove an attachment from a draft
 - `outlook-cli drafts send --id ID` — Send draft
+- `outlook-cli drafts send --id ID --at ISO_TIME` — Schedule the send (Exchange deferred send; `drafts delete` cancels it before then)
 - `outlook-cli drafts delete --id ID` — Delete draft
 
 ### Folders
