@@ -189,6 +189,42 @@ export function registerEmails(program: Command) {
     });
 
   emails
+    .command("forward")
+    .description("Forward an email")
+    .requiredOption("--id <id>", "Message ID to forward")
+    .requiredOption("--to <addresses>", "Comma-separated recipients")
+    .option("--text <text>", "Plain text note above the forwarded message")
+    .option("--html <html>", "HTML note above the forwarded message")
+    .option("--cc <addresses>", "Comma-separated CC")
+    .option("--bcc <addresses>", "Comma-separated BCC")
+    .option("--attach <path>", "Extra file to attach (repeatable)", collect, [])
+    .action(async (opts) => {
+      try {
+        const addrs = (s?: string) =>
+          s ? s.split(",").map((e: string) => ({ emailAddress: { address: e.trim() } })) : undefined;
+
+        // createForward → attach extra files → send. The original's attachments come along.
+        const draft = await graphRequest(`/me/messages/${opts.id}/createForward`, {
+          method: "POST",
+          body: JSON.stringify({
+            comment: opts.html || opts.text || "",
+            message: {
+              toRecipients: addrs(opts.to),
+              ccRecipients: addrs(opts.cc),
+              bccRecipients: addrs(opts.bcc),
+            },
+          }),
+        });
+
+        const attachPaths: string[] = opts.attach || [];
+        const attached = attachPaths.length > 0 ? await attachAllToDraft(draft.id, attachPaths) : [];
+        await graphRequest(`/me/messages/${draft.id}/send`, { method: "POST" });
+
+        out({ message: "Forward sent", attachments: attached.map((a) => ({ name: a.name, size: a.size })) });
+      } catch (e: any) { err(e.message, "FORWARD_FAILED"); }
+    });
+
+  emails
     .command("move")
     .description("Move an email to a folder")
     .requiredOption("--id <id>", "Message ID")

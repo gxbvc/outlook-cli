@@ -20,6 +20,7 @@ outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filt
 outlook-cli emails get --id MESSAGE_ID
 outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]
 outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all] [--attach PATH ...]
+outlook-cli emails forward --id MESSAGE_ID --to "a@b.com" [--html "<p>note</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]  # original's attachments come along
 outlook-cli emails move --id MESSAGE_ID --folder FOLDER_ID
 outlook-cli emails delete --id MESSAGE_ID
 outlook-cli emails read --id MESSAGE_ID              # Mark as read
@@ -31,6 +32,7 @@ outlook-cli emails download --id MESSAGE_ID [--attachment-id ATT_ID] [--out PATH
 outlook-cli drafts list [--limit 25]
 outlook-cli drafts create --to "a@b.com" --subject "Hi" [--text "body"] [--html "..."] [--cc "..."] [--bcc "..."] [--attach PATH ...]
 outlook-cli drafts reply --id MESSAGE_ID [--text "reply"] [--reply-all] [--attach PATH ...]
+outlook-cli drafts forward --id MESSAGE_ID [--to "a@b.com"] [--html "<p>note</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]  # returns owaUrl
 outlook-cli drafts update --id DRAFT_ID [--to "..."] [--subject "..."] [--text "..."] [--cc "..."] [--bcc "..."] [--attach PATH ...]
 outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]
 outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID

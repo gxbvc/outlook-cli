@@ -43,6 +43,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 - `outlook-cli emails get --id ID` — Get full email
 - `outlook-cli emails send --to ADDR --subject SUBJ --text BODY [--attach PATH ...]` — Send email
 - `outlook-cli emails reply --id ID --text BODY [--attach PATH ...]` — Reply to email
+- `outlook-cli emails forward --id ID --to ADDR [--html NOTE] [--cc ...] [--bcc ...] [--attach PATH ...]` — Forward email (keeps the original's attachments)
 - `outlook-cli emails move --id ID --folder FOLDER_ID` — Move email
 - `outlook-cli emails delete --id ID` — Delete email
 - `outlook-cli emails read --id ID` — Mark as read
@@ -54,6 +55,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 - `outlook-cli drafts list` — List drafts
 - `outlook-cli drafts create --to ADDR --subject SUBJ --text BODY [--cc ...] [--bcc ...] [--attach PATH ...]` — Create draft
 - `outlook-cli drafts reply --id ID [--attach PATH ...]` — Create reply draft
+- `outlook-cli drafts forward --id ID [--to ADDR] [--html NOTE] [--cc ...] [--bcc ...] [--attach PATH ...]` — Create forward draft
 - `outlook-cli drafts update --id ID [--subject SUBJ] [--cc ...] [--bcc ...] [--attach PATH ...]` — Update draft
 - `outlook-cli drafts attach --id DRAFT_ID --file PATH [--file PATH ...]` — Attach file(s) to a draft
 - `outlook-cli drafts detach --id DRAFT_ID --attachment-id ATT_ID` — Remove an attachment from a draft
@@ -84,7 +86,7 @@ Timezone defaults to `OUTLOOK_DEFAULT_TZ` (`America/Chicago` if unset). Override
 
 ## Attachments
 
-Repeat `--attach PATH` to attach files. Files ≤ 3 MiB are inlined into the request; larger files are transparently uploaded via Graph's `createUploadSession` flow in 5 MiB chunks. Works for `emails send`, `emails reply`, `drafts create`, `drafts reply`, and `drafts update`. You can also manage attachments on an existing draft directly:
+Repeat `--attach PATH` to attach files. Files ≤ 3 MiB are inlined into the request; larger files are transparently uploaded via Graph's `createUploadSession` flow in 5 MiB chunks. Works for `emails send`, `emails reply`, `emails forward`, `drafts create`, `drafts reply`, `drafts forward`, and `drafts update`. You can also manage attachments on an existing draft directly:
 
 ```bash
 outlook-cli emails send --to a@b.com --subject Hi --html "<p>Body</p>" \
