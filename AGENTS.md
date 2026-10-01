@@ -48,8 +48,9 @@ outlook-cli folders create --name "My Folder" [--parent PARENT_ID]
 # Calendar (timezone defaults to OUTLOOK_DEFAULT_TZ; falls back to America/Chicago)
 outlook-cli calendar list [--today] [--start ISO] [--end ISO] [--limit 50] [--search "query"] [--tz "America/Chicago"]
 outlook-cli calendar get --id EVENT_ID [--tz TZ]
-outlook-cli calendar create --subject "..." --start ISO --end ISO [--tz TZ] [--location "..."] [--html "<p>...</p>" | --body "..."] [--attendees "a@b.com,c@d.com"] [--online] [--all-day]
-outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end ISO] [--tz TZ] [--location "..."] [--html "..." | --body "..."] [--attendees "..."]
+outlook-cli calendar create --subject "..." --start ISO --end ISO [--tz TZ] [--location "..."] [--html "<p>...</p>" | --body "..."] [--attendees "a@b.com,c@d.com"] [--optional-attendees "e@f.com"] [--online] [--all-day] [--recurrence daily|weekly|biweekly|monthly|yearly] [--recurrence-days monday,tuesday]
+outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end ISO] [--tz TZ] [--location "..."] [--html "..." | --body "..."] [--attendees "..."] [--optional-attendees "..."] [--online]
+# update: passing --attendees or --optional-attendees replaces the whole attendee list. Pass both to keep both.
 outlook-cli calendar delete --id EVENT_ID              # Silent — does not notify attendees
 outlook-cli calendar cancel --id EVENT_ID [--comment "..."]  # Organizer only; sends cancellation to attendees. Occurrence ID cancels one instance
 ```
