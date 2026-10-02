@@ -15,7 +15,7 @@ outlook-cli auth    # Opens browser for OAuth2 login
 outlook-cli auth                                    # Authenticate (browser OAuth2 flow)
 outlook-cli me                                      # Get current user profile
 
-# Emails
+# Emails. send, reply, and forward always end with "Sent by my agent 🤖" (see note below the block)
 outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filter "..."] [--user EMAIL]
 outlook-cli emails get --id MESSAGE_ID
 outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]
@@ -54,6 +54,8 @@ outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end
 outlook-cli calendar delete --id EVENT_ID              # Silent — does not notify attendees
 outlook-cli calendar cancel --id EVENT_ID [--comment "..."]  # Organizer only; sends cancellation to attendees. Occurrence ID cancels one instance
 ```
+
+**Agent footer:** every email from `emails send`, `emails reply`, and `emails forward` ends with "Sent by my agent 🤖" (gray footer in HTML; no opt-out, never doubled). This marks it as agent-written, like the 🤖 prefix in slack-cli and imessages-cli. Do not add it yourself. Drafts get no footer, because Christian reviews and sends those. Plain `--text` replies and forwards are sent as HTML with `<br>` line breaks, because Graph collapses newlines in a reply comment.
 
 ## Examples
 

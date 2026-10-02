@@ -9,6 +9,7 @@ import {
   attachAllToDraft,
   INLINE_LIMIT_BYTES,
 } from "../attachments.js";
+import { footedContent, footedComment } from "../footer.js";
 
 const collect = (v: string, acc: string[]) => { acc.push(v); return acc; };
 
@@ -87,7 +88,7 @@ export function registerEmails(program: Command) {
             subject: opts.subject,
             body: {
               contentType: opts.html ? "HTML" : "Text",
-              content: opts.html || opts.text || "",
+              content: footedContent(opts),
             },
             toRecipients,
           };
@@ -117,7 +118,7 @@ export function registerEmails(program: Command) {
           subject: opts.subject,
           body: {
             contentType: opts.html ? "HTML" : "Text",
-            content: opts.html || opts.text || "",
+            content: footedContent(opts),
           },
           toRecipients,
         };
@@ -167,7 +168,7 @@ export function registerEmails(program: Command) {
           await graphRequest(`/me/messages/${opts.id}/${endpoint}`, {
             method: "POST",
             body: JSON.stringify({
-              comment: opts.html || opts.text || "",
+              comment: footedComment(opts),
             }),
           });
           out({ message: `Reply sent` });
@@ -178,7 +179,7 @@ export function registerEmails(program: Command) {
         const createEndpoint = opts.replyAll ? "createReplyAll" : "createReply";
         const draft = await graphRequest(`/me/messages/${opts.id}/${createEndpoint}`, {
           method: "POST",
-          body: JSON.stringify({ comment: opts.html || opts.text || "" }),
+          body: JSON.stringify({ comment: footedComment(opts) }),
         });
 
         const attached = await attachAllToDraft(draft.id, attachPaths);
@@ -207,7 +208,7 @@ export function registerEmails(program: Command) {
         const draft = await graphRequest(`/me/messages/${opts.id}/createForward`, {
           method: "POST",
           body: JSON.stringify({
-            comment: opts.html || opts.text || "",
+            comment: footedComment(opts),
             message: {
               toRecipients: addrs(opts.to),
               ccRecipients: addrs(opts.cc),
