@@ -34,6 +34,8 @@ export const SCOPES = [
   "https://graph.microsoft.com/Mail.Send.Shared",
   "https://graph.microsoft.com/Calendars.ReadWrite",
   "https://graph.microsoft.com/User.Read",
+  "https://graph.microsoft.com/OnlineMeetings.Read",
+  "https://graph.microsoft.com/OnlineMeetingTranscript.Read.All",
   "offline_access",
 ];
 

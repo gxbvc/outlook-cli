@@ -53,6 +53,16 @@ outlook-cli calendar update --id EVENT_ID [--subject "..."] [--start ISO] [--end
 # update: passing --attendees or --optional-attendees replaces the whole attendee list. Pass both to keep both.
 outlook-cli calendar delete --id EVENT_ID              # Silent — does not notify attendees
 outlook-cli calendar cancel --id EVENT_ID [--comment "..."]  # Organizer only; sends cancellation to attendees. Occurrence ID cancels one instance
+
+# Teams meetings and transcripts (take --join-url or --event-id from calendar list)
+outlook-cli meetings get --event-id EVENT_ID          # The onlineMeeting behind the event
+outlook-cli meetings transcripts --event-id EVENT_ID  # List transcripts (one per time transcription started)
+outlook-cli meetings transcript --event-id EVENT_ID [--since ISO] [--until ISO] [--transcript-id ID] [--format text|vtt] [--out PATH]
+# transcript: text is "Speaker Name: words" lines; several transcripts are joined in order.
+# --since/--until pick one occurrence of a recurring meeting (they share one join URL).
+# Graph only returns transcripts for meetings Christian organized. Others give MEETING_NOT_FOUND;
+# a meeting without transcription gives NO_TRANSCRIPT.
+# ~/utils/sync-teams-transcripts.sh (cron) uses this to copy transcripts into ~/scribe and scribe.gxb.vc.
 ```
 
 **Agent footer:** every email from `emails send`, `emails reply`, and `emails forward` ends with "Sent by my agent 🤖" (gray footer in HTML; no opt-out, never doubled). This marks it as agent-written, like the 🤖 prefix in slack-cli and imessages-cli. Do not add it yourself. Drafts get no footer, because Christian reviews and sends those. Plain `--text` replies and forwards are sent as HTML with `<br>` line breaks, because Graph collapses newlines in a reply comment.

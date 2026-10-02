@@ -52,13 +52,16 @@ async function exchangeCode(code: string): Promise<TokenData> {
   };
 }
 
-export async function refreshTokens(refreshToken: string): Promise<TokenData> {
+// Refresh with the scopes this token was granted, not SCOPES. When SCOPES gains
+// a new permission, asking for it on refresh fails until `outlook-cli auth` runs
+// again, and that would break email too.
+export async function refreshTokens(refreshToken: string, grantedScope?: string): Promise<TokenData> {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
     refresh_token: refreshToken,
     grant_type: "refresh_token",
-    scope: SCOPES.join(" "),
+    scope: grantedScope ? `${grantedScope} offline_access` : SCOPES.join(" "),
   });
 
   const res = await fetch(`${AUTHORITY}/oauth2/v2.0/token`, {
@@ -106,7 +109,7 @@ export async function getAccessToken(): Promise<string> {
       console.error(JSON.stringify({ ok: false, error: "No refresh token. Run: outlook-cli auth", code: "NO_REFRESH_TOKEN" }));
       process.exit(1);
     }
-    tokens = await refreshTokens(tokens.refresh_token);
+    tokens = await refreshTokens(tokens.refresh_token, tokens.scope);
     saveTokens(tokens);
   }
 

@@ -5,7 +5,7 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 ## Prerequisites
 
 - Node.js 18+
-- An Azure AD app registration with Microsoft Graph permissions (Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, User.Read)
+- An Azure AD app registration with Microsoft Graph permissions (Mail.Read, Mail.ReadWrite, Mail.Send, Calendars.ReadWrite, User.Read, OnlineMeetings.Read, OnlineMeetingTranscript.Read.All)
 
 ## Setup
 
