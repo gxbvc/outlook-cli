@@ -20,7 +20,14 @@ async function joinUrlFor(opts: { joinUrl?: string; eventId?: string }): Promise
 
 async function findMeeting(joinUrl: string): Promise<any> {
   const filter = encodeURIComponent(`JoinWebUrl eq '${joinUrl.replace(/'/g, "''")}'`);
-  const res = await graphRequest(`/me/onlineMeetings?$filter=${filter}`);
+  let res;
+  try {
+    res = await graphRequest(`/me/onlineMeetings?$filter=${filter}`);
+  } catch (e: any) {
+    // Someone else organized it. Graph only lets the organizer look it up.
+    if (/3003: User does not have access/.test(e.message)) err("No access: another user organized this meeting", "MEETING_NOT_FOUND");
+    throw e;
+  }
   const meeting = res?.value?.[0];
   if (!meeting) err("No Teams meeting found for that join URL", "MEETING_NOT_FOUND");
   return meeting;
