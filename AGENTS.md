@@ -60,7 +60,9 @@ outlook-cli meetings transcripts --event-id EVENT_ID  # List transcripts (one pe
 outlook-cli meetings transcript --event-id EVENT_ID [--since ISO] [--until ISO] [--transcript-id ID] [--format text|vtt] [--out PATH]
 # transcript: text is "Speaker Name: words" lines; several transcripts are joined in order.
 # --since/--until pick one occurrence of a recurring meeting (they share one join URL).
-# Graph only returns transcripts for meetings Christian organized. Others give MEETING_NOT_FOUND;
+# Graph returns transcripts for meetings organized by anyone in the gxb.vc tenant (Christian, Ricky, Sarah).
+# Meetings another company organized give MEETING_NOT_FOUND or 403. Meetings older than about 60 days
+# give 404 "3004: Specified meeting is not found" (the online meeting expired);
 # a meeting without transcription gives NO_TRANSCRIPT.
 # ~/utils/sync-teams-transcripts.sh (cron) uses this to copy transcripts into ~/scribe and scribe.gxb.vc.
 ```
