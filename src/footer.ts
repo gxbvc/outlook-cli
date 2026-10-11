@@ -2,7 +2,7 @@
 // readers can tell agent-written email from email Christian typed himself. Same
 // idea as the robot emoji in slack-cli and imessages-cli. Drafts get no footer,
 // because a person reviews and sends those. There is deliberately no opt-out.
-export const AGENT_FOOTER = "Sent by my agent \u{1F916}";
+export const AGENT_FOOTER = "Sent from my agent \u{1F916}";
 const AGENT_FOOTER_HTML = `<div style="color:#888888;font-size:12px">${AGENT_FOOTER}</div>`;
 
 export function withFooterText(text?: string): string {
