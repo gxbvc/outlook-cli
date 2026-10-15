@@ -10,6 +10,7 @@ import {
   INLINE_LIMIT_BYTES,
 } from "../attachments.js";
 import { footedContent, footedComment } from "../footer.js";
+import { collectAddrs, hasAddedRecipients, replyWithRecipients, forwardMessage } from "../reply.js";
 
 const collect = (v: string, acc: string[]) => { acc.push(v); return acc; };
 
@@ -158,10 +159,22 @@ export function registerEmails(program: Command) {
     .option("--text <text>", "Plain text reply")
     .option("--html <html>", "HTML reply")
     .option("--reply-all", "Reply to all recipients")
+    .option("--to <addresses>", "Add recipients to the reply (comma-separated, repeatable)", collectAddrs, [])
+    .option("--cc <addresses>", "Add CC recipients (comma-separated, repeatable)", collectAddrs, [])
+    .option("--bcc <addresses>", "Add BCC recipients (comma-separated, repeatable)", collectAddrs, [])
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
       try {
         const attachPaths: string[] = opts.attach || [];
+
+        if (hasAddedRecipients(opts)) {
+          // Added recipients: createReply(All) → PATCH recipients → attach → send, still in the thread
+          const { attached } = await replyWithRecipients({ ...opts, attach: attachPaths });
+          out(attached.length > 0
+            ? { message: "Reply sent", attachments: attached.map((a) => ({ name: a.name, size: a.size })) }
+            : { message: "Reply sent" });
+          return;
+        }
 
         if (attachPaths.length === 0) {
           const endpoint = opts.replyAll ? "replyAll" : "reply";
@@ -193,33 +206,16 @@ export function registerEmails(program: Command) {
     .command("forward")
     .description("Forward an email")
     .requiredOption("--id <id>", "Message ID to forward")
-    .requiredOption("--to <addresses>", "Comma-separated recipients")
+    .option("--to <addresses>", "Recipients (comma-separated, repeatable; required)", collectAddrs, [])
     .option("--text <text>", "Plain text note above the forwarded message")
     .option("--html <html>", "HTML note above the forwarded message")
-    .option("--cc <addresses>", "Comma-separated CC")
-    .option("--bcc <addresses>", "Comma-separated BCC")
+    .option("--cc <addresses>", "CC (comma-separated, repeatable)", collectAddrs, [])
+    .option("--bcc <addresses>", "BCC (comma-separated, repeatable)", collectAddrs, [])
     .option("--attach <path>", "Extra file to attach (repeatable)", collect, [])
     .action(async (opts) => {
       try {
-        const addrs = (s?: string) =>
-          s ? s.split(",").map((e: string) => ({ emailAddress: { address: e.trim() } })) : undefined;
-
         // createForward → attach extra files → send. The original's attachments come along.
-        const draft = await graphRequest(`/me/messages/${opts.id}/createForward`, {
-          method: "POST",
-          body: JSON.stringify({
-            comment: footedComment(opts),
-            message: {
-              toRecipients: addrs(opts.to),
-              ccRecipients: addrs(opts.cc),
-              bccRecipients: addrs(opts.bcc),
-            },
-          }),
-        });
-
-        const attachPaths: string[] = opts.attach || [];
-        const attached = attachPaths.length > 0 ? await attachAllToDraft(draft.id, attachPaths) : [];
-        await graphRequest(`/me/messages/${draft.id}/send`, { method: "POST" });
+        const { attached } = await forwardMessage({ ...opts, attach: opts.attach || [] });
 
         out({ message: "Forward sent", attachments: attached.map((a) => ({ name: a.name, size: a.size })) });
       } catch (e: any) { err(e.message, "FORWARD_FAILED"); }

@@ -42,8 +42,8 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 - `outlook-cli emails list` — List inbox emails
 - `outlook-cli emails get --id ID` — Get full email
 - `outlook-cli emails send --to ADDR --subject SUBJ --text BODY [--attach PATH ...]` — Send email
-- `outlook-cli emails reply --id ID --text BODY [--attach PATH ...]` — Reply to email
-- `outlook-cli emails forward --id ID --to ADDR [--html NOTE] [--cc ...] [--bcc ...] [--attach PATH ...]` — Forward email (keeps the original's attachments)
+- `outlook-cli emails reply --id ID --text BODY [--reply-all] [--to ADDR] [--cc ADDR] [--bcc ADDR] [--attach PATH ...]` — Reply to email; `--to/--cc/--bcc` (comma-separated or repeated) add people and keep the reply in the thread
+- `outlook-cli emails forward --id ID --to ADDR [--html NOTE] [--cc ...] [--bcc ...] [--attach PATH ...]` — Forward email; `--to/--cc/--bcc` are comma-separated or repeated (keeps the original's attachments)
 - `outlook-cli emails move --id ID --folder FOLDER_ID` — Move email
 - `outlook-cli emails delete --id ID` — Delete email
 - `outlook-cli emails read --id ID` — Mark as read

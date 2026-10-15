@@ -19,8 +19,9 @@ outlook-cli me                                      # Get current user profile
 outlook-cli emails list [--folder inbox] [--limit 25] [--search "query"] [--filter "..."] [--user EMAIL]
 outlook-cli emails get --id MESSAGE_ID
 outlook-cli emails send --to "a@b.com" --subject "Hi" [--text "body"] [--html "<p>body</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]
-outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all] [--attach PATH ...]
+outlook-cli emails reply --id MESSAGE_ID [--text "reply"] [--html "<p>reply</p>"] [--reply-all] [--to "..."] [--cc "..."] [--bcc "..."] [--attach PATH ...]  # --to/--cc/--bcc add people, stay in the thread
 outlook-cli emails forward --id MESSAGE_ID --to "a@b.com" [--html "<p>note</p>"] [--cc "..."] [--bcc "..."] [--attach PATH ...]  # original's attachments come along
+# --to/--cc/--bcc on reply and forward: comma-separated and/or repeated (--cc a@x.com,b@x.com --cc c@x.com).
 outlook-cli emails move --id MESSAGE_ID --folder FOLDER_ID
 outlook-cli emails delete --id MESSAGE_ID
 outlook-cli emails read --id MESSAGE_ID              # Mark as read
@@ -66,6 +67,8 @@ outlook-cli meetings transcript --event-id EVENT_ID [--since ISO] [--until ISO] 
 # a meeting without transcription gives NO_TRANSCRIPT.
 # ~/utils/sync-teams-transcripts.sh (cron) uses this to copy transcripts into ~/scribe and scribe.gxb.vc.
 ```
+
+**Reply recipients:** `emails reply` without `--to/--cc/--bcc` calls Graph `/reply` (or `/replyAll`). With any of them it calls `createReply` (or `createReplyAll`), PATCHes the recipients, attaches files, and sends, so the reply stays in the thread with the quoted history. Added addresses join the existing recipients. An address already in To, Cc or Bcc is not added again (compared case-insensitively), no existing recipient is dropped, and the sending mailbox is never added to itself. Without `--reply-all` the reply goes to the sender plus any `--to`. If a step fails, the half-built draft is deleted. To let Christian review first, use `drafts reply` and send from Outlook.
 
 **Agent footer:** every email from `emails send`, `emails reply`, and `emails forward` ends with "Sent from my agent 🤖" (gray footer in HTML; no opt-out, never doubled). This marks it as agent-written, like the 🤖 prefix in slack-cli and imessages-cli. Do not add it yourself. Drafts get no footer, because Christian reviews and sends those. Plain `--text` replies and forwards are sent as HTML with `<br>` line breaks, because Graph collapses newlines in a reply comment.
 

@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
-    "auth": "tsx src/auth.ts"
+    "auth": "tsx src/auth.ts",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "commander": "^12.0.0",

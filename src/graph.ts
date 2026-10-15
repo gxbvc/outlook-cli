@@ -7,7 +7,13 @@ function mailboxPath(path: string): string {
   return `/users/${encodeURIComponent(user)}` + path.slice(3);
 }
 
+// Tests replace the HTTP layer with this. Receives the resolved path (after --user mapping).
+export type Transport = (path: string, options: RequestInit) => Promise<any>;
+let testTransport: Transport | null = null;
+export function setTransportForTests(t: Transport | null): void { testTransport = t; }
+
 export async function graphRequest(path: string, options: RequestInit = {}): Promise<any> {
+  if (testTransport) return testTransport(mailboxPath(path), options);
   const token = await getAccessToken();
   const resolved = mailboxPath(path);
   const url = resolved.startsWith("http") ? resolved : `${GRAPH_BASE}${resolved}`;
