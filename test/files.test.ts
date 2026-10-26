@@ -269,14 +269,30 @@ test("404 becomes a friendly NOT_FOUND error", async () => {
   assert.equal(o.code, "NOT_FOUND");
 });
 
-test("403 becomes CONSENT_REQUIRED with the scope hint", async () => {
+test("403 becomes CONSENT_REQUIRED with the exact auth hint", async () => {
   setTransportForTests(async () => {
-    throw new GraphError(403, "Graph API 403: Access denied. Missing scope Files.Read.All");
+    throw new GraphError(403, "Graph API 403: Access denied. InsufficientPermissions: the token lacks Files.Read.All");
   });
   const o = await run("ls", "/");
   assert.equal(o.ok, false);
   assert.equal(o.code, "CONSENT_REQUIRED");
   assert.match(o.error, /Files\.Read\.All/);
+  assert.match(o.error, /run outlook-cli auth/);
+  // every files subcommand maps the missing-scope 403 the same way
+  for (const args of [["info", "x.txt"], ["search", "q"]]) {
+    const o2 = await run(...args);
+    assert.equal(o2.code, "CONSENT_REQUIRED");
+    assert.match(o2.error, /run outlook-cli auth/);
+  }
+});
+
+test("the auth request now includes the three files scopes", async () => {
+  const { SCOPES } = await import("../src/config.js");
+  for (const scope of ["Files.Read.All", "Sites.Read.All", "Files.ReadWrite.All"]) {
+    assert.equal(SCOPES.some((s: string) => s.endsWith(scope)), true, `SCOPES includes ${scope}`);
+  }
+  // the mail scopes are untouched
+  assert.equal(SCOPES.some((s: string) => s.endsWith("Mail.Send")), true);
 });
 
 test("429 with Retry-After becomes THROTTLED and names the wait", async () => {

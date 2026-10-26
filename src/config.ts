@@ -36,6 +36,9 @@ export const SCOPES = [
   "https://graph.microsoft.com/User.Read",
   "https://graph.microsoft.com/OnlineMeetings.Read",
   "https://graph.microsoft.com/OnlineMeetingTranscript.Read.All",
+  "https://graph.microsoft.com/Files.Read.All",
+  "https://graph.microsoft.com/Sites.Read.All",
+  "https://graph.microsoft.com/Files.ReadWrite.All",
   "offline_access",
 ];
 

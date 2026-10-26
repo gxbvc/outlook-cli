@@ -65,8 +65,8 @@ outlook-cli meetings transcript --event-id EVENT_ID [--since ISO] [--until ISO] 
 # Meetings another company organized give MEETING_NOT_FOUND or 403. Meetings older than about 60 days
 # give 404 "3004: Specified meeting is not found" (the online meeting expired);
 # a meeting without transcription gives NO_TRANSCRIPT.
-# OneDrive / SharePoint files (read + upload; needs Files.Read.All + Sites.Read.All consent,
-# plus Files.ReadWrite.All for put/sync; then re-run auth)
+# OneDrive / SharePoint files (read + upload; scopes are in SCOPES and requested by the next auth:
+# Files.Read.All + Sites.Read.All for read, Files.ReadWrite.All for put/sync; the Azure app must consent too)
 outlook-cli files search QUERY [--drive me|ricky]     # search a drive; slim results (name, id, size, path, hash)
 outlook-cli files ls PATH [--drive me|ricky]          # list a folder; paths relative to drive root (e.g. 10_Products)
 outlook-cli files info PATH [--drive me|ricky]        # one item's metadata, never file contents

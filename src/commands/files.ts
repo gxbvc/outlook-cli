@@ -139,7 +139,7 @@ function graphFail(e: any): never {
   if (status === 404) err("Not found in this drive (404). Check the path and --drive.", "NOT_FOUND");
   if (status === 403)
     err(
-      "Access denied (403). The app likely lacks Files.Read.All / Sites.Read.All consent. Grant the scopes, then run `outlook-cli auth` again.",
+      "Access denied (403). The signed-in token lacks the files scopes (Files.Read.All, Sites.Read.All, Files.ReadWrite.All). Grant them on the Azure app if not yet, then run outlook-cli auth.",
       "CONSENT_REQUIRED"
     );
   if (status === 429)

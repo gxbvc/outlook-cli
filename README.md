@@ -88,7 +88,7 @@ Drives: `me` is your OneDrive (`/me/drive`). `ricky` is the SharePoint document 
 
 Read only. There are no delete, move, or write commands, and nothing in OneDrive is ever modified.
 
-**Setup (needs consent):** `files get/search/ls/info` require the delegated Graph scopes `Files.Read.All` and `Sites.Read.All` (read only); `files put` and `files sync` additionally need `Files.ReadWrite.All`. They must be added to the Azure app registration and to `SCOPES` in `src/config.ts`, then run `outlook-cli auth` once. Until then, `files` commands return `CONSENT_REQUIRED` (403).
+**Setup (needs consent):** the files scopes — `Files.Read.All`, `Sites.Read.All`, `Files.ReadWrite.All` (delegated, `Files.ReadWrite.All` only for `put`/`sync`) — are in `SCOPES` in `src/config.ts` and requested by the next `outlook-cli auth`; the Azure app registration must also have them added and consented. Until both are done, `files` commands return `CONSENT_REQUIRED` (403) with the hint to run `outlook-cli auth`.
 
 ## Tips
 
