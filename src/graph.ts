@@ -58,13 +58,10 @@ export async function graphRawRequest(path: string, options: RequestInit = {}): 
   const token = await getAccessToken();
   const resolved = mailboxPath(path);
   const url = resolved.startsWith("http") ? resolved : `${GRAPH_BASE}${resolved}`;
-  return fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...options.headers,
-    },
-  });
+  // Absolute URLs (Graph upload-session URLs) are preauthenticated: no token there.
+  const headers: Record<string, string> = { ...(options.headers as Record<string, string>) };
+  if (!resolved.startsWith("http")) headers.Authorization = `Bearer ${token}`;
+  return fetch(url, { ...options, headers });
 }
 
 // The `webLink` Graph hands back is a legacy /owa/?ItemID= link that answers 401

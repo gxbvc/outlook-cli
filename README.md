@@ -81,12 +81,14 @@ Timezone defaults to `OUTLOOK_DEFAULT_TZ` (`America/Chicago` if unset). Override
 - `outlook-cli files ls PATH [--drive me|ricky]` — List a folder; paths are relative to the drive root (e.g. `10_Products`)
 - `outlook-cli files info PATH [--drive me|ricky]` — Show one item's metadata (name, id, size, hash); never file contents
 - `outlook-cli files get PATH [--drive me|ricky] [--out DIR]` — Download a file. Default cache is `~/tmp/onedrive-cache` (dir mode 700, files mode 600); saves under `<cache>/<drive>/<path>`. Streams to disk (safe for large files) and prints the local path, size and sha256.
+- `outlook-cli files put LOCAL PATH [--drive me|ricky] [--force] [--mkdir]` — Upload a local file. Never deletes or moves anything. Refuses to overwrite (`ALREADY_EXISTS`) without `--force`; `--force` replaces a file only, never a folder. Missing parent folders need `--mkdir`. Files over 4 MiB upload through a Graph upload session in 5 MiB chunks (never held in memory). Prints size, sha256, remote id.
+- `outlook-cli files sync LOCAL_DIR PATH [--drive me|ricky] --dry-run|--apply` — Mirror a local folder into the drive: uploads only new or changed files (size + sha1 compared against Graph's hashes). Never deletes remote files, never replaces a remote folder. `--dry-run` prints the plan and counts only. Creates missing remote folders on `--apply`.
 
 Drives: `me` is your OneDrive (`/me/drive`). `ricky` is the SharePoint document library "Ricky Bureau - GXB"; its drive id is resolved once via a Graph site search and cached (id only) in `tokens/drive-ids.json`.
 
 Read only. There are no delete, move, or write commands, and nothing in OneDrive is ever modified.
 
-**Setup (needs consent):** `files` requires the delegated Graph scopes `Files.Read.All` and `Sites.Read.All` (read only). They must be added to the Azure app registration and to `SCOPES` in `src/config.ts`, then run `outlook-cli auth` once. Until then, `files` commands return `CONSENT_REQUIRED` (403).
+**Setup (needs consent):** `files get/search/ls/info` require the delegated Graph scopes `Files.Read.All` and `Sites.Read.All` (read only); `files put` and `files sync` additionally need `Files.ReadWrite.All`. They must be added to the Azure app registration and to `SCOPES` in `src/config.ts`, then run `outlook-cli auth` once. Until then, `files` commands return `CONSENT_REQUIRED` (403).
 
 ## Tips
 

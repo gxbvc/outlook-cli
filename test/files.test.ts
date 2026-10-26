@@ -13,9 +13,11 @@ process.env.OUTLOOK_TENANT_ID ||= "test";
 const { setTransportForTests, GraphError } = await import("../src/graph.js");
 const { registerFiles } = await import("../src/commands/files.js");
 
-type Call = { path: string; method: string };
+type Call = { path: string; method: string; body?: any; contentRange?: string; bodyLen?: number };
 let calls: Call[] = [];
 let lines: string[] = [];
+// Extra GET routes per test: remote drive path (no "/me/drive/root:/" prefix) → drive item.
+let remoteItems: Record<string, any> = {};
 const realLog = console.log;
 const realExit = process.exit;
 
@@ -41,9 +43,43 @@ beforeEach(() => {
   delete process.env.OUTLOOK_USER;
   const cacheFile = join(mkdtempSync(join(tmpdir(), "odcache-")), "drive-ids.json");
   process.env.OUTLOOK_DRIVE_CACHE = cacheFile;
+  remoteItems = {};
   setTransportForTests(async (path, options) => {
-    calls.push({ path, method: String(options.method || "GET") });
+    const method = String(options.method || "GET");
     const q = path.split("?")[0];
+    const body = options.body;
+    const record: Call = {
+      path,
+      method,
+      contentRange: (options.headers as any)?.["Content-Range"],
+      bodyLen: body ? (body as any).length : undefined,
+    };
+    if (typeof body === "string") {
+      try { record.body = JSON.parse(body); } catch { record.body = body; }
+    }
+    calls.push(record);
+    if (q.startsWith("https://upload.example/")) {
+      // Chunk PUT. The final chunk (end == total-1) returns the drive item.
+      const range = record.contentRange || ""; // "bytes start-end/total"
+      const end = parseInt(range.split(" ")[1]?.split("-")[1] || "0", 10);
+      const total = parseInt(range.split("/")[1] || "0", 10);
+      if (end === total - 1)
+        return new Response(JSON.stringify({ name: "big.bin", id: "UPLOADED1", size: total }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      return new Response(JSON.stringify({ nextExpectedRanges: [`${end + 1}-`] }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (q.endsWith(":/createUploadSession") && method === "POST")
+      return { uploadUrl: "https://upload.example/session1", nextExpectedRanges: [] };
+    if (q.endsWith(":/content") && method === "PUT")
+      return new Response(JSON.stringify({ name: "file", id: "UPLOADED-SIMPLE", size: record.bodyLen }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    if (q.endsWith("/children") && method === "POST")
+      return { name: record.body?.name, id: `FOLDER-CREATED-${record.body?.name}`, folder: {} };
     if (q === "/sites/SITE1/drive") return { id: "DRIVE1", name: "Ricky Bureau - GXB" };
     if (q.startsWith("/sites")) return { value: [{ id: "SITE1", displayName: "Ricky Bureau - GXB" }] };
     if (q.includes("/search(q=")) return { value: [searchItem()] };
@@ -52,8 +88,15 @@ beforeEach(() => {
     if (q === "/drives/DRIVE1/root:/docs:/children") return { value: [searchItem()] };
     if (q === "/drives/DRIVE1/root:/docs/report.pdf") return { ...driveItem, parentReference: { path: "/drives/DRIVE1/root:/docs" } };
     if (q === "/me/drive/root:/10_Products/report.pdf") return driveItem;
+    if (q === "/me/drive/root:/docs" || q === "/me/drive/root:/somedir" || q === "/me/drive/root:/syncdst" || q === "/me/drive/root:/uploads")
+      return { name: q.split("/").pop(), id: "FOLDER1", folder: {} };
+    if (q === "/me/drive/root:/docs/report.pdf") return driveItem;
     if (q === "/me/drive/root:/10_Products/report.pdf:/content") return new Response("file-body-contents");
     if (q === "/drives/DRIVE1/root:/docs/report.pdf:/content") return new Response("ricky-file-body-contents");
+    if (q.startsWith("/me/drive/root:/")) {
+      const rel = q.slice("/me/drive/root:/".length);
+      if (rel in remoteItems) return remoteItems[rel];
+    }
     throw new GraphError(404, "Graph API 404: item not found");
   });
   console.log = (s: string) => { lines.push(String(s)); };
@@ -78,7 +121,7 @@ async function run(...args: string[]): Promise<any> {
   } catch (e: any) {
     if (!/^exit \d+$/.test(e.message)) throw e;
   }
-  return JSON.parse(lines[0]);
+  return JSON.parse(lines[lines.length - 1]);
 }
 
 function outObj(): any {
@@ -199,4 +242,175 @@ test("429 with Retry-After becomes THROTTLED and names the wait", async () => {
   assert.equal(o.ok, false);
   assert.equal(o.code, "THROTTLED");
   assert.match(o.error, /30 seconds/);
+});
+
+test("put uploads a small new file with a simple PUT and prints sha256", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odput-"));
+  try {
+    const local = join(dir, "hello.txt");
+    writeFileSync(local, "hello put body");
+    const o = await run("put", local, "uploads/hello.txt");
+    const contentPut = calls.find((c) => c.method === "PUT" && c.path.endsWith("/uploads/hello.txt:/content"));
+    assert.ok(contentPut, "expected a PUT to the content endpoint");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.replaced, false);
+    assert.equal(o.data.size, 14);
+    assert.equal(o.data.sha256, createHash("sha256").update("hello put body").digest("hex"));
+    assert.equal(o.data.uploadedVia, "simple");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("put refuses to overwrite an existing file without --force", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odput-"));
+  try {
+    const local = join(dir, "report.pdf");
+    writeFileSync(local, "new body");
+    const o = await run("put", local, "docs/report.pdf");
+    assert.equal(o.ok, false);
+    assert.equal(o.code, "ALREADY_EXISTS");
+    assert.equal(calls.some((c) => c.method === "PUT"), false, "no upload may happen");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("put --force replaces an existing file, never a folder", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odput-"));
+  try {
+    const local = join(dir, "report.pdf");
+    writeFileSync(local, "new body");
+    const o = await run("put", local, "docs/report.pdf", "--force");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.replaced, true);
+    assert.equal(calls.some((c) => c.method === "PUT"), true);
+
+    writeFileSync(join(dir, "x.txt"), "x");
+    const o2 = await run("put", join(dir, "x.txt"), "somedir", "--force");
+    assert.equal(o2.ok, false);
+    assert.equal(o2.code, "IS_FOLDER");
+    assert.equal(calls.some((c) => c.method === "PUT" && c.path.endsWith("/somedir:/content")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("put needs --mkdir for a missing parent and then creates the folders", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odput-"));
+  try {
+    const local = join(dir, "file.txt");
+    writeFileSync(local, "deep");
+    const o = await run("put", local, "newdir/deep/file.txt");
+    assert.equal(o.code, "PARENT_MISSING");
+    assert.equal(calls.some((c) => c.method === "POST"), false);
+
+    const o2 = await run("put", local, "newdir/deep/file.txt", "--mkdir");
+    assert.equal(o2.ok, true);
+    const created = calls.filter((c) => c.method === "POST" && c.path.endsWith("/children")).map((c) => c.body.name);
+    assert.deepEqual(created, ["newdir", "deep"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("put uses a chunked upload session over 4 MiB with Content-Range", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odput-"));
+  try {
+    const local = join(dir, "big.bin");
+    // 5.5 MiB: two chunks (5 MiB + 0.5 MiB), both multiples of 320 KiB.
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.uploadedVia, "session");
+    const session = calls.find((c) => c.method === "POST" && c.path.endsWith("/uploads/big.bin:/createUploadSession"));
+    assert.ok(session, "expected createUploadSession");
+    assert.equal(session.body.item["@microsoft.graph.conflictBehavior"], "fail");
+    const chunks = calls.filter((c) => c.path.startsWith("https://upload.example/"));
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0].contentRange, "bytes 0-5242879/5767168");
+    assert.equal(chunks[1].contentRange, "bytes 5242880-5767167/5767168");
+    assert.equal(o.data.sha256, createHash("sha256").update(readFileSync(local)).digest("hex"));
+    // No bearer token may be sent to the preauthenticated upload URL.
+    assert.equal(o.data.id, "UPLOADED1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sync dry-run plans uploads (new, changed, unchanged, folder) without uploading", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odsync-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "unchanged.txt"), "same");
+    writeFileSync(join(src, "changed.txt"), "new content");
+    writeFileSync(join(src, "new.txt"), "brand new");
+    writeFileSync(join(src, "folder.txt"), "collides with a remote folder");
+    const sha1 = (s: string) => createHash("sha1").update(s).digest("hex").toUpperCase();
+    remoteItems = {
+      "syncdst/unchanged.txt": { name: "unchanged.txt", id: "U1", size: 4, file: { hashes: { sha1Hash: sha1("same") } } },
+      "syncdst/changed.txt": { name: "changed.txt", id: "C1", size: 11, file: { hashes: { sha1Hash: sha1("old content") } } },
+      "syncdst/folder.txt": { name: "folder.txt", id: "F1", folder: {} },
+    };
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.mode, "dry-run");
+    assert.equal(o.data.scanned, 4);
+    assert.equal(o.data.uploads, 2);
+    assert.equal(o.data.unchanged, 1);
+    assert.deepEqual(o.data.files.map((f: any) => f.file), ["changed.txt", "folder.txt", "new.txt"]);
+    assert.equal(o.data.files[0].changed, true);
+    assert.equal(o.data.files[1].skipped, "remote path is a folder; never replaced");
+    assert.equal(o.data.files[2].changed, false);
+    assert.equal(calls.some((c) => c.method === "PUT" || c.method === "POST"), false, "dry-run uploads nothing");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sync apply uploads only new and changed files, never deletes remote", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odsync-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "unchanged.txt"), "same");
+    writeFileSync(join(src, "changed.txt"), "new content");
+    writeFileSync(join(src, "new.txt"), "brand new");
+    const sha1 = (s: string) => createHash("sha1").update(s).digest("hex").toUpperCase();
+    remoteItems = {
+      "syncdst/unchanged.txt": { name: "unchanged.txt", id: "U1", size: 4, file: { hashes: { sha1Hash: sha1("same") } } },
+      "syncdst/changed.txt": { name: "changed.txt", id: "C1", size: 11, file: { hashes: { sha1Hash: sha1("old content") } } },
+    };
+    const o = await run("sync", src, "syncdst", "--apply");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.uploads, 2);
+    assert.equal(o.data.unchanged, 1);
+    const puts = calls.filter((c) => c.method === "PUT" && c.path.endsWith(":/content")).map((c) => c.path);
+    assert.deepEqual(puts, [
+      "/me/drive/root:/syncdst/changed.txt:/content",
+      "/me/drive/root:/syncdst/new.txt:/content",
+    ]);
+    const o2 = await run("sync", src, "syncdst", "--dry-run");
+    assert.deepEqual(
+      o2.data.files.filter((f: any) => !f.skipped).map((f: any) => [f.file, f.changed]),
+      [["changed.txt", true], ["new.txt", false]]
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sync requires exactly one of --dry-run or --apply", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odsync-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    const o = await run("sync", src, "syncdst");
+    assert.equal(o.code, "BAD_MODE");
+    const o2 = await run("sync", src, "syncdst", "--dry-run", "--apply");
+    assert.equal(o2.code, "BAD_MODE");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

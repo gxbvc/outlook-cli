@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { chmodSync, createWriteStream, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "fs";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { createHash } from "crypto";
@@ -14,6 +14,11 @@ import { GraphError, graphRawRequest, graphRequest, out, err } from "../graph.js
 
 const DEFAULT_CACHE = join(homedir(), "tmp", "onedrive-cache");
 const SHARED_LIBRARY_NAME = "Ricky Bureau - GXB";
+
+// Files over 4 MiB upload through a Graph upload session in chunks; the chunk
+// size must be a multiple of 320 KiB, so 5 MiB it is.
+const UPLOAD_SESSION_THRESHOLD = 4 * 1024 * 1024;
+const UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
 
 // --drive ricky resolves the shared library's drive id once through a site
 // search and caches only the id here (never tokens or file data).
@@ -108,6 +113,97 @@ async function checkRaw(res: Response, path: string): Promise<Response> {
   throw new GraphError(res.status, `Graph API ${res.status} ${path}: ${body}`, retryAfter ? parseInt(retryAfter, 10) : null);
 }
 
+function isNotFound(e: any): boolean {
+  return e instanceof GraphError && e.status === 404;
+}
+
+// Create missing folders one segment at a time (conflictBehavior fail: never
+// replaces an existing folder). Only called when the user asked for it.
+async function ensureFolder(base: string, segments: string[]): Promise<void> {
+  let cur = "";
+  for (const seg of segments) {
+    const item = cur ? `${base}/root:/${cur}/${encodeURIComponent(seg)}` : `${base}/root:/${encodeURIComponent(seg)}`;
+    const parent = cur ? `${base}/root:/${cur}` : `${base}/root`;
+    try {
+      await graphRequest(item);
+    } catch (e: any) {
+      if (!isNotFound(e)) throw e;
+      await graphRequest(`${parent}/children`, {
+        method: "POST",
+        body: JSON.stringify({ name: seg, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
+      });
+    }
+    cur = cur ? `${cur}/${encodeURIComponent(seg)}` : encodeURIComponent(seg);
+  }
+}
+
+// Upload one local file. Small: single PUT. Large: an upload session, streamed
+// one chunk at a time (never the whole file in memory). Hashes while sending.
+async function uploadFile(base: string, rel: string, localPath: string, replace: boolean) {
+  const total = statSync(localPath).size;
+  const hash = createHash("sha256");
+  const enc = encPath(rel);
+
+  if (total <= UPLOAD_SESSION_THRESHOLD) {
+    const data = readFileSync(localPath);
+    hash.update(data);
+    const res = await checkRaw(
+      await graphRawRequest(`${base}/root:/${enc}:/content`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: data,
+      }),
+      rel
+    );
+    const item = await res.json();
+    return { id: item.id, size: total, sha256: hash.digest("hex"), mode: "simple" };
+  }
+
+  const session = await graphRequest(`${base}/root:/${enc}:/createUploadSession`, {
+    method: "POST",
+    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": replace ? "replace" : "fail" } }),
+  });
+  const uploadUrl = session?.uploadUrl;
+  if (!uploadUrl) err("Graph returned no upload URL for the session", "UPLOAD_SESSION_FAILED");
+
+  let item: any = null;
+  for (let start = 0; start < total; start += UPLOAD_CHUNK_SIZE) {
+    const end = Math.min(start + UPLOAD_CHUNK_SIZE, total) - 1;
+    const len = end - start + 1;
+    const buf = Buffer.alloc(len);
+    const fd = openSync(localPath, "r");
+    try {
+      readSync(fd, buf, 0, len, start);
+    } finally {
+      closeSync(fd);
+    }
+    hash.update(buf);
+    const chunkRes = await graphRawRequest(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": String(len),
+        "Content-Range": `bytes ${start}-${end}/${total}`,
+      },
+      body: buf,
+    });
+    if (!chunkRes.ok) {
+      const body = await chunkRes.text();
+      throw new GraphError(chunkRes.status, `Graph API ${chunkRes.status} chunk ${start}-${end}: ${body}`);
+    }
+    const text = await chunkRes.text();
+    if (text) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.id) item = parsed; // the final chunk returns the drive item
+      } catch {
+        // 202 progress responses are JSON, but never fail the upload over parsing
+      }
+    }
+  }
+  if (!item) err("Upload finished but Graph returned no drive item", "UPLOAD_INCOMPLETE");
+  return { id: item.id, size: total, sha256: hash.digest("hex"), mode: "session" };
+}
+
 export function registerFiles(program: Command) {
   const files = program.command("files").description("OneDrive and SharePoint files (read only)");
 
@@ -200,6 +296,149 @@ export function registerFiles(program: Command) {
         chmodSync(target, 0o600);
 
         out({ drive: opts.drive, path: p, localPath: target, size, sha256: hash.digest("hex") });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("put")
+    .description(
+      "Upload a local file. Never deletes or moves anything; refuses to overwrite without --force (files only, never a folder)."
+    )
+    .argument("<local>", "Local file path")
+    .argument("<path>", "Remote path relative to the drive root")
+    .option("--drive <drive>", "me or ricky", "me")
+    .option("--force", "Replace the remote file if it exists (never replaces a folder)")
+    .option("--mkdir", "Create missing parent folders")
+    .action(async (local, p, opts) => {
+      try {
+        const base = await driveBase(opts.drive);
+        const enc = encPath(p);
+        if (!enc) err("Give a remote path, e.g. 10_Products/notes.txt", "BAD_PATH");
+        const localPath = resolvePath(expandTilde(local));
+        if (!existsSync(localPath) || !statSync(localPath).isFile()) err(`No local file: ${localPath}`, "LOCAL_MISSING");
+
+        const segments = p.split("/").filter(Boolean);
+        if (segments.length > 1) {
+          const dir = segments.slice(0, -1);
+          try {
+            await graphRequest(itemPath(base, dir.join("/")));
+          } catch (e: any) {
+            if (!isNotFound(e)) throw e;
+            if (!opts.mkdir) err(`Remote folder "${dir.join("/")}" does not exist; pass --mkdir to create it`, "PARENT_MISSING");
+            await ensureFolder(base, dir);
+          }
+        }
+
+        // Exists? Without --force: refuse. With --force: replace files only,
+        // never a folder (conflictBehavior=replace on a file below).
+        let replace = false;
+        try {
+          const existing = await graphRequest(itemPath(base, p));
+          if (existing.folder) err(`Remote path "${p}" is a folder; put only replaces files`, "IS_FOLDER");
+          if (!opts.force) err(`"${p}" already exists; pass --force to replace the file`, "ALREADY_EXISTS");
+          replace = true;
+        } catch (e: any) {
+          if (!isNotFound(e)) throw e;
+        }
+
+        const r = await uploadFile(base, p, localPath, replace);
+        out({ drive: opts.drive, path: p, localPath, size: r.size, sha256: r.sha256, id: r.id, uploadedVia: r.mode, replaced: replace });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("sync")
+    .description(
+      "Mirror a local folder into the drive: uploads only new or changed files (size + sha1 compared against Graph). Never deletes remote files."
+    )
+    .argument("<dir>", "Local folder to upload")
+    .argument("<path>", "Remote target folder relative to the drive root")
+    .option("--drive <drive>", "me or ricky", "me")
+    .option("--dry-run", "Show the upload plan without uploading")
+    .option("--apply", "Upload the new or changed files")
+    .action(async (dir, p, opts) => {
+      try {
+        if (!!opts.dryRun === !!opts.apply) err("Give exactly one of --dry-run or --apply", "BAD_MODE");
+        const base = await driveBase(opts.drive);
+        const localDir = resolvePath(expandTilde(dir));
+        if (!existsSync(localDir) || !statSync(localDir).isDirectory()) err(`No local folder: ${localDir}`, "LOCAL_MISSING");
+
+        const localFiles: string[] = [];
+        (function walk(d: string, rel: string) {
+          for (const e of readdirSync(join(d, rel), { withFileTypes: true })) {
+            if (e.name === ".DS_Store") continue;
+            const r = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) walk(d, r);
+            else if (e.isFile()) localFiles.push(r);
+          }
+        })(localDir, "");
+        localFiles.sort();
+
+        const plan: any[] = [];
+        let unchanged = 0;
+        for (const rel of localFiles) {
+          const remoteRel = p ? `${p.replace(/\/+$/, "")}/${rel}` : rel;
+          const st = statSync(join(localDir, rel));
+          const localSha1 = createHash("sha1").update(readFileSync(join(localDir, rel))).digest("hex").toUpperCase();
+          let remote: any = null;
+          try {
+            remote = await graphRequest(itemPath(base, remoteRel));
+          } catch (e: any) {
+            if (!isNotFound(e)) throw e;
+          }
+          if (remote?.folder) {
+            plan.push({ file: rel, remote: remoteRel, skipped: "remote path is a folder; never replaced" });
+            continue;
+          }
+          const same =
+            remote && remote.size === st.size && String(remote.file?.hashes?.sha1Hash || "").toUpperCase() === localSha1;
+          if (same) {
+            unchanged++;
+            continue;
+          }
+          plan.push({ file: rel, remote: remoteRel, size: st.size, changed: !!remote });
+        }
+
+        const toUpload = plan.filter((u) => !u.skipped);
+        if (opts.apply) {
+          try {
+            await graphRequest(itemPath(base, p));
+          } catch (e: any) {
+            if (!isNotFound(e)) throw e;
+            await ensureFolder(base, p.split("/").filter(Boolean));
+          }
+          for (const u of toUpload) {
+            const relSegments = u.remote.split("/").filter(Boolean);
+            const dir = relSegments.slice(0, -1);
+            if (dir.length) {
+              try {
+                await graphRequest(itemPath(base, dir.join("/")));
+              } catch (e: any) {
+                if (!isNotFound(e)) throw e;
+                await ensureFolder(base, dir);
+              }
+            }
+            const r = await uploadFile(base, u.remote, join(localDir, u.file), !!u.changed);
+            u.id = r.id;
+            u.sha256 = r.sha256;
+            u.uploadedVia = r.mode;
+          }
+        }
+
+        out({
+          drive: opts.drive,
+          localDir,
+          remote: p,
+          mode: opts.apply ? "apply" : "dry-run",
+          scanned: localFiles.length,
+          uploads: toUpload.length,
+          unchanged,
+          files: plan,
+        });
       } catch (e: any) {
         graphFail(e);
       }
