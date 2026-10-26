@@ -53,14 +53,18 @@ export async function graphRequest(path: string, options: RequestInit = {}): Pro
 
 // Like graphRequest but returns the raw Response, for binary/streaming endpoints
 // (file downloads). Tests may return a Response object from the stub transport.
+// Absolute URLs (Graph upload-session URLs) are preauthenticated: no token
+// there. Exposed for tests so the no-token-on-upload-URL rule is checkable.
+export function authHeadersFor(resolved: string, token: string): Record<string, string> {
+  return resolved.startsWith("http") ? {} : { Authorization: `Bearer ${token}` };
+}
+
 export async function graphRawRequest(path: string, options: RequestInit = {}): Promise<Response> {
   if (testTransport) return testTransport(mailboxPath(path), options);
   const token = await getAccessToken();
   const resolved = mailboxPath(path);
   const url = resolved.startsWith("http") ? resolved : `${GRAPH_BASE}${resolved}`;
-  // Absolute URLs (Graph upload-session URLs) are preauthenticated: no token there.
-  const headers: Record<string, string> = { ...(options.headers as Record<string, string>) };
-  if (!resolved.startsWith("http")) headers.Authorization = `Bearer ${token}`;
+  const headers = { ...authHeadersFor(resolved, token), ...(options.headers as Record<string, string>) };
   return fetch(url, { ...options, headers });
 }
 

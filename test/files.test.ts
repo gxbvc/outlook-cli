@@ -1,9 +1,9 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Command } from "commander";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import { createHash } from "crypto";
 
 process.env.OUTLOOK_CLIENT_ID ||= "test";
@@ -18,6 +18,8 @@ let calls: Call[] = [];
 let lines: string[] = [];
 // Extra GET routes per test: remote drive path (no "/me/drive/root:/" prefix) → drive item.
 let remoteItems: Record<string, any> = {};
+// Per-test override: content endpoint path → HTTP status to force (412 races).
+let putStatus: Record<string, number> = {};
 const realLog = console.log;
 const realExit = process.exit;
 
@@ -26,7 +28,7 @@ const driveItem = {
   name: "report.pdf",
   id: "ITEM1",
   size: 18,
-  file: { hashes: { quickXorHash: "QUICKXORHASH1" } },
+  file: { hashes: { quickXorHash: "p0V3g8nQAjG8gQx5esEY3uAGOpQ=" } },
   lastModifiedDateTime: "2026-10-26T12:00:00Z",
   parentReference: { path: "/drive/root:/10_Products" },
   webUrl: "https://example.sharepoint.com/report.pdf",
@@ -44,6 +46,7 @@ beforeEach(() => {
   const cacheFile = join(mkdtempSync(join(tmpdir(), "odcache-")), "drive-ids.json");
   process.env.OUTLOOK_DRIVE_CACHE = cacheFile;
   remoteItems = {};
+  putStatus = {};
   setTransportForTests(async (path, options) => {
     const method = String(options.method || "GET");
     const q = path.split("?")[0];
@@ -52,6 +55,7 @@ beforeEach(() => {
       path,
       method,
       contentRange: (options.headers as any)?.["Content-Range"],
+      ifMatch: (options.headers as any)?.["If-Match"],
       bodyLen: body ? (body as any).length : undefined,
     };
     if (typeof body === "string") {
@@ -74,10 +78,12 @@ beforeEach(() => {
     }
     if (q.endsWith(":/createUploadSession") && method === "POST")
       return { uploadUrl: "https://upload.example/session1", nextExpectedRanges: [] };
-    if (q.endsWith(":/content") && method === "PUT")
+    if (q.endsWith(":/content") && method === "PUT") {
+      if (putStatus[q]) return new Response(JSON.stringify({ error: "forced" }), { status: putStatus[q] });
       return new Response(JSON.stringify({ name: "file", id: "UPLOADED-SIMPLE", size: record.bodyLen }), {
         headers: { "Content-Type": "application/json" },
       });
+    }
     if (q.endsWith("/children") && method === "POST")
       return { name: record.body?.name, id: `FOLDER-CREATED-${record.body?.name}`, folder: {} };
     if (q === "/sites/SITE1/drive") return { id: "DRIVE1", name: "Ricky Bureau - GXB" };
@@ -86,7 +92,8 @@ beforeEach(() => {
     if (q === "/me/drive/root/children") return { value: [driveItem] };
     if (q === "/me/drive/root:/10_Products/My%20Folder:/children") return { value: [childItem] };
     if (q === "/drives/DRIVE1/root:/docs:/children") return { value: [searchItem()] };
-    if (q === "/drives/DRIVE1/root:/docs/report.pdf") return { ...driveItem, parentReference: { path: "/drives/DRIVE1/root:/docs" } };
+    if (q === "/drives/DRIVE1/root:/docs/report.pdf")
+      return { ...driveItem, size: 24, file: { hashes: { quickXorHash: "002gYFWLb0aeFt0NPkMLxPAGMuQ=" } }, parentReference: { path: "/drives/DRIVE1/root:/docs" } };
     if (q === "/me/drive/root:/10_Products/report.pdf") return driveItem;
     if (q === "/me/drive/root:/docs" || q === "/me/drive/root:/somedir" || q === "/me/drive/root:/syncdst" || q === "/me/drive/root:/uploads")
       return { name: q.split("/").pop(), id: "FOLDER1", folder: {} };
@@ -158,7 +165,7 @@ test("info shows metadata only (name, id, size, hash), no contents", async () =>
     size: 18,
     path: "10_Products/report.pdf",
     lastModified: "2026-10-26T12:00:00Z",
-    hash: "QUICKXORHASH1",
+    hash: "p0V3g8nQAjG8gQx5esEY3uAGOpQ=",
     webUrl: "https://example.sharepoint.com/report.pdf",
   });
 });
@@ -182,6 +189,8 @@ test("get streams to a temp cache dir with mode 600 and correct sha256", async (
     assert.equal(readFileSync(expected, "utf8"), "file-body-contents");
     assert.equal(statSync(expected).mode & 0o777, 0o600);
     assert.equal(statSync(join(dir, "me", "10_Products")).mode & 0o777, 0o700);
+    assert.equal(statSync(join(dir, "me")).mode & 0o777, 0o700, "the whole folder chain is 700, not just the leaf");
+    assert.equal(statSync(dir).mode & 0o777, 0o700);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -250,7 +259,7 @@ test("put uploads a small new file with a simple PUT and prints sha256", async (
     const local = join(dir, "hello.txt");
     writeFileSync(local, "hello put body");
     const o = await run("put", local, "uploads/hello.txt");
-    const contentPut = calls.find((c) => c.method === "PUT" && c.path.endsWith("/uploads/hello.txt:/content"));
+    const contentPut = calls.find((c) => c.method === "PUT" && c.path.split("?")[0].endsWith("/uploads/hello.txt:/content"));
     assert.ok(contentPut, "expected a PUT to the content endpoint");
     assert.equal(o.ok, true);
     assert.equal(o.data.replaced, false);
@@ -386,7 +395,9 @@ test("sync apply uploads only new and changed files, never deletes remote", asyn
     assert.equal(o.ok, true);
     assert.equal(o.data.uploads, 2);
     assert.equal(o.data.unchanged, 1);
-    const puts = calls.filter((c) => c.method === "PUT" && c.path.endsWith(":/content")).map((c) => c.path);
+    const puts = calls
+      .filter((c) => c.method === "PUT" && c.path.split("?")[0].endsWith(":/content"))
+      .map((c) => c.path.split("?")[0]);
     assert.deepEqual(puts, [
       "/me/drive/root:/syncdst/changed.txt:/content",
       "/me/drive/root:/syncdst/new.txt:/content",
@@ -463,5 +474,298 @@ test("sync compares quickXorHash (business drives) and falls back to sha1", asyn
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Review round 1 fixes ---
+
+test("M1: dot-dot segments are refused before any Graph call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odm1-"));
+  try {
+    const o = await run("get", "../../../drives/OTHER/root:/f", "--out", dir);
+    assert.equal(o.code, "BAD_PATH");
+    assert.equal(calls.length, 0, "no Graph request may leave the machine");
+    const o2 = await run("info", "a/../b");
+    assert.equal(o2.code, "BAD_PATH");
+    const o3 = await run("ls", "a/../b");
+    assert.equal(o3.code, "BAD_PATH");
+    writeFileSync(join(dir, "local.txt"), "x");
+    const o4 = await run("put", join(dir, "local.txt"), "a/../../escape.txt");
+    assert.equal(o4.code, "BAD_PATH");
+    const o5 = await run("sync", dir, "dst/../escape", "--dry-run");
+    assert.equal(o5.code, "BAD_PATH");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M1: backslashes and control characters are refused", async () => {
+  const o = await run("info", "a\\b.txt");
+  assert.equal(o.code, "BAD_PATH");
+  const o2 = await run("ls", "a\u0001b");
+  assert.equal(o2.code, "BAD_PATH");
+});
+
+test("M1: get refuses a symlink at the target instead of writing through it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odsym-"));
+  try {
+    const target = join(dir, "me", "10_Products", "report.pdf");
+    mkdirSync(dirname(target), { recursive: true });
+    symlinkSync("/etc/passwd", target);
+    const o = await run("get", "10_Products/report.pdf", "--out", dir);
+    assert.equal(o.code, "PATH_ESCAPE");
+    assert.equal(readFileSync("/etc/passwd", "utf8").includes("file-body-contents"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M2: the simple PUT always carries @microsoft.graph.conflictBehavior", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odm2-"));
+  try {
+    const local = join(dir, "hello.txt");
+    writeFileSync(local, "hello put body");
+    const o = await run("put", local, "uploads/hello.txt");
+    assert.equal(o.ok, true);
+    const put1 = calls.find((c) => c.method === "PUT" && c.path.split("?")[0].endsWith("/uploads/hello.txt:/content"));
+    assert.match(put1!.path, /\?@microsoft\.graph\.conflictBehavior=fail$/);
+    const o2 = await run("put", local, "docs/report.pdf", "--force");
+    assert.equal(o2.ok, true);
+    const put2 = calls.filter((c) => c.method === "PUT" && c.path.split("?")[0].endsWith("/docs/report.pdf:/content")).pop();
+    assert.match(put2!.path, /\?@microsoft\.graph\.conflictBehavior=replace$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M3: sync --apply replaces only files whose remote copy is older; If-Match sent; 412 is a conflict", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odm3-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "older.txt"), "older remote");
+    writeFileSync(join(src, "newer.txt"), "newer remote");
+    writeFileSync(join(src, "race.txt"), "raced file");
+    writeFileSync(join(src, "fresh.txt"), "brand new");
+    remoteItems = {
+      // remote older than local: replaced, with If-Match from the plan
+      "syncdst/older.txt": {
+        name: "older.txt", id: "OLD1", size: 99, eTag: "\"ETAG-OLD1\"",
+        lastModifiedDateTime: "2000-01-01T00:00:00Z", file: { hashes: { quickXorHash: "WRONG=" } },
+      },
+      // remote newer than local: CONFLICT, never replaced
+      "syncdst/newer.txt": {
+        name: "newer.txt", id: "NEW1", size: 99, eTag: "\"ETAG-NEW1\"",
+        lastModifiedDateTime: "2030-01-01T00:00:00Z", file: { hashes: { quickXorHash: "WRONG=" } },
+      },
+      // remote older but the PUT races with a 412: skipped as conflict
+      "syncdst/race.txt": {
+        name: "race.txt", id: "RACE1", size: 99, eTag: "\"ETAG-RACE1\"",
+        lastModifiedDateTime: "2000-01-01T00:00:00Z", file: { hashes: { quickXorHash: "WRONG=" } },
+      },
+    };
+    putStatus["/me/drive/root:/syncdst/race.txt:/content"] = 412;
+    const o = await run("sync", src, "syncdst", "--apply");
+    const entry = (n: string) => o.data.files.find((f: any) => f.file === n);
+    assert.equal(entry("newer.txt").conflict, "remote is newer than the local file");
+    assert.equal(o.data.conflicts, 2); // newer.txt + the 412 on race.txt
+    assert.equal(o.data.uploads, 2); // older.txt + fresh.txt
+    const olderPut = calls.find((c) => c.method === "PUT" && c.path.split("?")[0].endsWith("/syncdst/older.txt:/content"));
+    assert.equal(olderPut!.ifMatch, "\"ETAG-OLD1\"");
+    assert.equal(calls.some((c) => c.method === "PUT" && c.path.split("?")[0].endsWith("/syncdst/newer.txt:/content")), false);
+    assert.equal(entry("race.txt").conflict, "remote changed during upload (412); skipped");
+    assert.equal(entry("fresh.txt").uploadedVia, "simple");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M4: --drive ricky needs an exact library name and caches nothing on miss", async () => {
+  setTransportForTests(async (path) => {
+    const q = path.split("?")[0];
+    if (q.startsWith("/sites")) return { value: [{ id: "SITE9", displayName: "Wrong Library" }] };
+    throw new GraphError(404, "Graph API 404: should never get past site search");
+  });
+  const o = await run("info", "docs/report.pdf", "--drive", "ricky");
+  assert.equal(o.code, "SITE_NOT_FOUND");
+  assert.equal(calls.some((c) => c.path.startsWith("/drives/")), false, "no drive may be picked as a fallback");
+  assert.equal(existsSync(process.env.OUTLOOK_DRIVE_CACHE), false, "nothing cached on a miss");
+});
+
+test("SHOULD: a throttled chunk is retried with Retry-After, then the session is cancelled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odretry-"));
+  try {
+    const local = join(dir, "big.bin");
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    let chunkAttempts = 0;
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      calls.push({ path, method });
+      const q = path.split("?")[0];
+      if (q.startsWith("https://upload.example/")) {
+        if (method === "DELETE") return new Response(null, { status: 204 });
+        chunkAttempts++;
+        return new Response(JSON.stringify({ error: "throttled" }), { status: 429, headers: { "Retry-After": "0" } });
+      }
+      if (q === "/me/drive/root:/uploads") return { name: "uploads", id: "FOLDER1", folder: {} };
+      if (q.endsWith(":/createUploadSession") && method === "POST")
+        return { uploadUrl: "https://upload.example/session1" };
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.code, "THROTTLED");
+    assert.equal(chunkAttempts, 4, "1 attempt + 3 retries");
+    assert.match(o.error, /after 3 retries/);
+    assert.equal(calls.some((c) => c.method === "DELETE" && c.path.startsWith("https://upload.example/")), true, "session cancelled");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: a throttled chunk succeeds on retry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odretry2-"));
+  try {
+    const local = join(dir, "big.bin");
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    let chunkAttempts = 0;
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      const q = path.split("?")[0];
+      if (q.startsWith("https://upload.example/")) {
+        chunkAttempts++;
+        if (chunkAttempts === 1) return new Response(JSON.stringify({ e: 1 }), { status: 429, headers: { "Retry-After": "0" } });
+        if (chunkAttempts < 3) return new Response(JSON.stringify({ nextExpectedRanges: ["1-"] }), { status: 202 });
+        return new Response(JSON.stringify({ name: "big.bin", id: "UPLOADED1", size: 5 * 1024 * 1024 + 512 * 1024 }));
+      }
+      if (q === "/me/drive/root:/uploads") return { name: "uploads", id: "FOLDER1", folder: {} };
+      if (q.endsWith(":/createUploadSession") && method === "POST") return { uploadUrl: "https://upload.example/session1" };
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.ok, true);
+    assert.equal(chunkAttempts, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: a failed download leaves no partial file or .part leftover", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odpart-"));
+  try {
+    setTransportForTests(async (path) => {
+      const q = path.split("?")[0];
+      if (q === "/me/drive/root:/10_Products/report.pdf") return driveItem;
+      if (q.endsWith(":/content")) {
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(Buffer.from("partial"));
+              controller.error(new Error("connection dropped"));
+            },
+          })
+        );
+      }
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    let o: any;
+    try {
+      o = await run("get", "10_Products/report.pdf", "--out", dir);
+    } catch (e: any) {
+      o = { ok: false, error: e.message }; // the network error surfaces through parseAsync
+    }
+    assert.match(String(o.error), /connection dropped/);
+    const target = join(dir, "me", "10_Products", "report.pdf");
+    assert.equal(existsSync(target), false);
+    const leftovers = (function walk(d: string): string[] {
+      return readdirSync(d, { withFileTypes: true }).flatMap((e: any) =>
+        e.isDirectory() ? walk(join(d, e.name)) : e.name.includes(".part") ? [join(d, e.name)] : []
+      );
+    })(dir);
+    assert.deepEqual(leftovers, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: ls follows @odata.nextLink", async () => {
+  setTransportForTests(async (path) => {
+    const q = path.split("?")[0];
+    if (q === "/me/drive/root/children") {
+      return { value: [{ name: "p1.txt", id: "1", size: 1, file: {} }], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/children?page=2" };
+    }
+    if (path.includes("page=2")) return { value: [{ name: "p2.txt", id: "2", size: 2, file: {} }] };
+    throw new GraphError(404, "Graph API 404: unexpected " + q);
+  });
+  const o = await run("ls", "/");
+  assert.equal(o.data.count, 2);
+  assert.deepEqual(o.data.items.map((i: any) => i.name), ["p1.txt", "p2.txt"]);
+});
+
+test("SHOULD: sync reports case-only collisions and symlinks, never uploads them", async () => {
+  // APFS here is case-insensitive, so the two spellings cannot both exist on
+  // disk; the collision rule itself is a pure function, tested directly.
+  const { detectCaseCollisions } = await import("../src/commands/files.js");
+  assert.deepEqual(
+    [...detectCaseCollisions(["A.txt", "a.txt", "plain.txt"])].sort(),
+    ["A.txt", "a.txt"]
+  );
+  assert.equal(detectCaseCollisions(["a.txt", "b.txt"]).size, 0);
+
+  const dir = mkdtempSync(join(tmpdir(), "odcase-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "a.txt"), "plain");
+    symlinkSync(join(src, "a.txt"), join(src, "link.txt"));
+    writeFileSync(join(src, "plain.txt"), "plain");
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.data.files.find((f: any) => f.file === "link.txt").skipped, "symlink");
+    assert.equal(o.data.uploads, 2);
+    assert.equal(o.data.conflicts, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: the bearer token never goes on an absolute (upload session) URL", async () => {
+  const { authHeadersFor } = await import("../src/graph.js");
+  assert.deepEqual(authHeadersFor("https://upload.example/session1", "SECRET"), {});
+  assert.deepEqual(authHeadersFor("/me/drive/root:/f", "SECRET"), { Authorization: "Bearer SECRET" });
+});
+
+test("SHOULD: a local file that changes size during upload cancels the session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odgrow-"));
+  try {
+    const local = join(dir, "big.bin");
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      calls.push({ path, method });
+      const q = path.split("?")[0];
+      if (q.startsWith("https://upload.example/")) {
+        if (method === "DELETE") return new Response(null, { status: 204 });
+        // Simulate another process appending to the file mid-upload.
+        appendFileSync(local, "grown");
+        return new Response(JSON.stringify({ nextExpectedRanges: ["1-"] }), { status: 202 });
+      }
+      if (q === "/me/drive/root:/uploads") return { name: "uploads", id: "FOLDER1", folder: {} };
+      if (q.endsWith(":/createUploadSession") && method === "POST") return { uploadUrl: "https://upload.example/session1" };
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.code, "LOCAL_FILE_CHANGED");
+    assert.equal(calls.some((c) => c.method === "DELETE" && c.path.startsWith("https://upload.example/")), true, "session cancelled");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("NIT: files refuses the global --user remap", async () => {
+  process.env.OUTLOOK_USER = "someone@example.com";
+  try {
+    const o = await run("ls", "/");
+    assert.equal(o.code, "USER_UNSUPPORTED");
+  } finally {
+    delete process.env.OUTLOOK_USER;
   }
 });

@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { runAuthFlow } from "./auth.js";
+import { err } from "./graph.js";
 import { registerEmails } from "./commands/emails.js";
 import { registerDrafts } from "./commands/drafts.js";
 import { registerFolders } from "./commands/folders.js";
@@ -40,4 +41,8 @@ registerCalendar(program);
 registerMeetings(program);
 registerFiles(program);
 
-program.parse();
+// An async action that throws (a non-Graph error, e.g. a network failure)
+// must still produce the JSON error envelope, not a raw Node stack trace.
+program.parseAsync(process.argv).catch((e: any) => {
+  err(e?.message || String(e));
+});

@@ -1,17 +1,18 @@
 import { Command } from "commander";
-import { chmodSync, closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, createWriteStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { createHash } from "crypto";
-import { dirname, join, resolve as resolvePath } from "path";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "path";
 import { homedir } from "os";
 import { TOKENS_DIR } from "../config.js";
 import { GraphError, graphRawRequest, graphRequest, out, err } from "../graph.js";
 import { QuickXorHash } from "../quickxor.js";
 
-// OneDrive and SharePoint files via Graph. Read only: search, ls, info, get.
-// Needs Files.Read.All and Sites.Read.All (delegated); re-run `outlook-cli auth`
-// once those scopes are granted. Never deletes or moves anything.
+// OneDrive and SharePoint files via Graph. Read: search, ls, info, get.
+// Upload: put, sync (needs Files.ReadWrite.All on top of Files.Read.All and
+// Sites.Read.All; re-run `outlook-cli auth` once those scopes are granted).
+// Never deletes or moves anything.
 
 const DEFAULT_CACHE = join(homedir(), "tmp", "onedrive-cache");
 const SHARED_LIBRARY_NAME = "Ricky Bureau - GXB";
@@ -44,8 +45,10 @@ async function rickyDriveId(): Promise<string> {
   const cache = readDriveCache();
   if (cache[SHARED_LIBRARY_NAME]) return cache[SHARED_LIBRARY_NAME];
   const sites = await graphRequest(`/sites?search=${encodeURIComponent(SHARED_LIBRARY_NAME)}`);
-  const site = sites?.value?.find((s: any) => s.displayName === SHARED_LIBRARY_NAME) || sites?.value?.[0];
-  if (!site) err(`SharePoint site "${SHARED_LIBRARY_NAME}" not found. Check Sites.Read.All consent.`, "SITE_NOT_FOUND");
+  // Exact library name only. A fuzzy or first-hit fallback would cache the
+  // wrong drive id and later puts/syncs would write into an unrelated library.
+  const site = sites?.value?.find((s: any) => s.displayName === SHARED_LIBRARY_NAME);
+  if (!site) err(`SharePoint site "${SHARED_LIBRARY_NAME}" not found (exact match). Check Sites.Read.All consent.`, "SITE_NOT_FOUND");
   const drive = await graphRequest(`/sites/${site.id}/drive`);
   cache[SHARED_LIBRARY_NAME] = drive.id;
   writeDriveCache(cache);
@@ -53,14 +56,24 @@ async function rickyDriveId(): Promise<string> {
 }
 
 async function driveBase(drive: string): Promise<string> {
+  // The global --user remaps /me to another mailbox; files commands do not support it.
+  if (process.env.OUTLOOK_USER) err("files does not support --user", "USER_UNSUPPORTED");
   if (drive === "me") return "/me/drive";
   if (drive === "ricky") return `/drives/${await rickyDriveId()}`;
   err(`Unknown drive "${drive}" (use me or ricky)`, "BAD_DRIVE");
 }
 
-// Encode each path segment so spaces, #, % and unicode survive the URL.
+// Encode each path segment so spaces, #, % and unicode survive the URL, but
+// first reject anything that could escape the drive or the local cache: empty
+// segments, ".", "..", backslashes and control characters. WHATWG URL parsing
+// would otherwise resolve dot segments out of the encoded path.
 function encPath(rel: string): string {
-  return rel.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+  const segs = rel.split("/");
+  for (const seg of segs) {
+    if (!seg || seg === "." || seg === "..") err(`Bad path segment "${seg}" in "${rel}"`, "BAD_PATH");
+    if (seg.includes("\\") || /[\u0000-\u001f\u007f]/.test(seg)) err(`Bad character in path segment "${seg}"`, "BAD_PATH");
+  }
+  return segs.map(encodeURIComponent).join("/");
 }
 
 // Graph item path relative to the drive root ("root:/segment/segment").
@@ -98,12 +111,33 @@ function graphFail(e: any): never {
       "Access denied (403). The app likely lacks Files.Read.All / Sites.Read.All consent. Grant the scopes, then run `outlook-cli auth` again.",
       "CONSENT_REQUIRED"
     );
-  if (status === 429) err(`Throttled (429). Retry after ${e.retryAfter ?? "unknown"} seconds.`, "THROTTLED");
+  if (status === 429)
+    err(
+      /after \d+ retries/.test(e.message)
+        ? e.message
+        : `Throttled (429). Retry after ${e.retryAfter ?? "unknown"} seconds.`,
+      "THROTTLED"
+    );
   throw e;
 }
 
 function expandTilde(p: string): string {
   return p.replace(/^~(?=\/|$)/, homedir());
+}
+
+// Create the folder chain from root down to dir and chmod every level 700 —
+// a cache root or drive folder that already existed keeps its old mode otherwise.
+function mkdirChmodChain(root: string, dir: string): void {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const rel = relative(root, dir);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return;
+  let cur = root;
+  for (const seg of rel.split(sep).filter(Boolean)) {
+    cur = join(cur, seg);
+    mkdirSync(cur, { recursive: true, mode: 0o700 });
+    chmodSync(cur, 0o700);
+  }
 }
 
 // Turn a raw Response (streaming download) into a GraphError when not ok.
@@ -138,71 +172,140 @@ async function ensureFolder(base: string, segments: string[]): Promise<void> {
   }
 }
 
-// Upload one local file. Small: single PUT. Large: an upload session, streamed
-// one chunk at a time (never the whole file in memory). Hashes while sending.
-async function uploadFile(base: string, rel: string, localPath: string, replace: boolean) {
-  const total = statSync(localPath).size;
+// Stream the sha1 of a local file (fallback for personal OneDrive items).
+function sha1Of(localPath: string): string {
+  const hash = createHash("sha1");
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex").toUpperCase();
+}
+
+// Upload one local file. Small: single PUT with conflictBehavior on the URL.
+// Large: an upload session, streamed one chunk at a time (never the whole file
+// in memory), chunks retried on 429/5xx with Retry-After (max 3), the session
+// cancelled on final failure. Hashes while sending; refuses when the local
+// file changes size during the upload.
+async function uploadFile(base: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
+  const startSize = statSync(localPath).size;
   const hash = createHash("sha256");
   const enc = encPath(rel);
+  const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
+  if (ifMatch) headers["If-Match"] = ifMatch;
 
-  if (total <= UPLOAD_SESSION_THRESHOLD) {
+  if (startSize <= UPLOAD_SESSION_THRESHOLD) {
     const data = readFileSync(localPath);
+    if (data.length !== startSize) err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
     hash.update(data);
     const res = await checkRaw(
-      await graphRawRequest(`${base}/root:/${enc}:/content`, {
+      await graphRawRequest(`${base}/root:/${enc}:/content?@microsoft.graph.conflictBehavior=${replace ? "replace" : "fail"}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/octet-stream" },
+        headers,
         body: data,
       }),
       rel
     );
     const item = await res.json();
-    return { id: item.id, size: total, sha256: hash.digest("hex"), mode: "simple" };
+    return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "simple", eTag: item.eTag };
   }
 
+  const sessionHeaders: Record<string, string> = {};
+  if (ifMatch) sessionHeaders["If-Match"] = ifMatch;
   const session = await graphRequest(`${base}/root:/${enc}:/createUploadSession`, {
     method: "POST",
+    headers: sessionHeaders,
     body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": replace ? "replace" : "fail" } }),
   });
   const uploadUrl = session?.uploadUrl;
   if (!uploadUrl) err("Graph returned no upload URL for the session", "UPLOAD_SESSION_FAILED");
 
+  const cancelSession = async () => {
+    try {
+      await graphRawRequest(uploadUrl, { method: "DELETE" });
+    } catch {
+      // cancelling is best effort
+    }
+  };
+
   let item: any = null;
-  for (let start = 0; start < total; start += UPLOAD_CHUNK_SIZE) {
-    const end = Math.min(start + UPLOAD_CHUNK_SIZE, total) - 1;
+  let sent = 0;
+  for (let start = 0; start < startSize; start += UPLOAD_CHUNK_SIZE) {
+    const end = Math.min(start + UPLOAD_CHUNK_SIZE, startSize) - 1;
     const len = end - start + 1;
     const buf = Buffer.alloc(len);
     const fd = openSync(localPath, "r");
+    let nRead = 0;
     try {
-      readSync(fd, buf, 0, len, start);
+      nRead = readSync(fd, buf, 0, len, start);
     } finally {
       closeSync(fd);
     }
-    hash.update(buf);
-    const chunkRes = await graphRawRequest(uploadUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Length": String(len),
-        "Content-Range": `bytes ${start}-${end}/${total}`,
-      },
-      body: buf,
-    });
-    if (!chunkRes.ok) {
-      const body = await chunkRes.text();
-      throw new GraphError(chunkRes.status, `Graph API ${chunkRes.status} chunk ${start}-${end}: ${body}`);
+    if (nRead !== len || statSync(localPath).size !== startSize) {
+      await cancelSession();
+      err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
     }
-    const text = await chunkRes.text();
-    if (text) {
-      try {
-        const parsed = JSON.parse(text);
-        if (parsed.id) item = parsed; // the final chunk returns the drive item
-      } catch {
-        // 202 progress responses are JSON, but never fail the upload over parsing
+    const chunk = nRead === buf.length ? buf : buf.subarray(0, nRead);
+    hash.update(chunk);
+
+    let attempt = 0;
+    for (;;) {
+      const chunkRes = await graphRawRequest(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": String(chunk.length),
+          "Content-Range": `bytes ${start}-${start + chunk.length - 1}/${startSize}`,
+        },
+        body: chunk,
+      });
+      if (chunkRes.ok) {
+        sent += chunk.length;
+        const text = await chunkRes.text();
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed.id) item = parsed; // the final chunk returns the drive item
+          } catch {
+            // 202 progress responses are JSON, but never fail the upload over parsing
+          }
+        }
+        break;
       }
+      const retryAfter = chunkRes.headers.get("Retry-After");
+      const body = await chunkRes.text();
+      const retryable = chunkRes.status === 429 || chunkRes.status >= 500;
+      if (retryable && attempt < 3) {
+        attempt++;
+        const delay = retryAfter ? parseInt(retryAfter, 10) * 1000 : 200 * 2 ** attempt;
+        await new Promise((r) => setTimeout(r, Math.min(delay, 5000)));
+        continue;
+      }
+      await cancelSession();
+      throw new GraphError(
+        chunkRes.status,
+        `Graph API ${chunkRes.status} chunk ${start}-${start + chunk.length - 1} after ${attempt} retries: ${body}`,
+        retryAfter ? parseInt(retryAfter, 10) : null
+      );
     }
   }
+  if (statSync(localPath).size !== startSize || sent !== startSize) {
+    await cancelSession();
+    err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
+  }
   if (!item) err("Upload finished but Graph returned no drive item", "UPLOAD_INCOMPLETE");
-  return { id: item.id, size: total, sha256: hash.digest("hex"), mode: "session" };
+  // Verify what Graph stored against what we sent.
+  const remoteQxh = item.file?.hashes?.quickXorHash;
+  if (remoteQxh && remoteQxh !== quickXorHashOf(localPath)) {
+    err(`Uploaded quickXorHash mismatch for "${rel}"; the upload did not round-trip`, "UPLOAD_HASH_MISMATCH");
+  }
+  return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "session", eTag: item.eTag };
 }
 
 // OneDrive for Business and SharePoint return only quickXorHash in
@@ -224,8 +327,25 @@ function quickXorHashOf(localPath: string): string {
   return q.digestBase64();
 }
 
+// OneDrive is case-insensitive: a.txt and A.txt map to one remote item, so
+// uploading both would silently replace one with the other. Refuse both.
+export function detectCaseCollisions(rels: string[]): Set<string> {
+  const seen = new Map<string, string>();
+  const collisions = new Set<string>();
+  for (const rel of rels) {
+    const key = rel.toLowerCase();
+    if (seen.has(key)) {
+      collisions.add(seen.get(key)!);
+      collisions.add(rel);
+    } else {
+      seen.set(key, rel);
+    }
+  }
+  return collisions;
+}
+
 export function registerFiles(program: Command) {
-  const files = program.command("files").description("OneDrive and SharePoint files (read only)");
+  const files = program.command("files").description("OneDrive and SharePoint files (read and upload)");
 
   files
     .command("search")
@@ -236,9 +356,15 @@ export function registerFiles(program: Command) {
       try {
         const base = await driveBase(opts.drive);
         const sq = encodeURIComponent(query.replace(/'/g, "''"));
-        const data = await graphRequest(`${base}/search(q='${sq}')?$top=50`);
-        const results = (data?.value || []).map(slim);
-        out({ query, drive: opts.drive, count: results.length, results });
+        // Follow @odata.nextLink so large result sets are not cut off.
+        const results: any[] = [];
+        let url: string | null = `${base}/search(q='${sq}')?$top=50`;
+        for (let hops = 0; url && hops < 20; hops++) {
+          const data = await graphRequest(url);
+          results.push(...(data?.value || []));
+          url = data?.["@odata.nextLink"] || null;
+        }
+        out({ query, drive: opts.drive, count: results.length, results: results.map(slim) });
       } catch (e: any) {
         graphFail(e);
       }
@@ -252,13 +378,20 @@ export function registerFiles(program: Command) {
     .action(async (p, opts) => {
       try {
         const base = await driveBase(opts.drive);
-        const enc = encPath(p);
-        const url = enc
-          ? `${base}/root:/${enc}:/children?$select=name,id,size,folder,file,lastModifiedDateTime,parentReference,webUrl`
-          : `${base}/root/children?$select=name,id,size,folder,file,lastModifiedDateTime,parentReference,webUrl`;
-        const data = await graphRequest(url);
-        const items = (data?.value || []).map(slim);
-        out({ drive: opts.drive, path: p, count: items.length, items });
+        const isRoot = p === "/" || p.trim() === "";
+        const enc = isRoot ? "" : encPath(p);
+        const select = "$select=name,id,size,folder,file,lastModifiedDateTime,parentReference,webUrl";
+        // Follow @odata.nextLink so folders over the page size are complete.
+        const items: any[] = [];
+        let url: string | null = enc
+          ? `${base}/root:/${enc}:/children?${select}`
+          : `${base}/root/children?${select}`;
+        for (let hops = 0; url && hops < 50; hops++) {
+          const data = await graphRequest(url);
+          items.push(...(data?.value || []));
+          url = data?.["@odata.nextLink"] || null;
+        }
+        out({ drive: opts.drive, path: p, count: items.length, items: items.map(slim) });
       } catch (e: any) {
         graphFail(e);
       }
@@ -293,27 +426,55 @@ export function registerFiles(program: Command) {
         const meta = await graphRequest(`${base}/root:/${enc}`);
         if (meta.folder) err("That path is a folder; `files get` works on files only", "IS_FOLDER");
 
-        const res = await checkRaw(await graphRawRequest(`${base}/root:/${enc}:/content`), p);
         const cacheRoot = resolvePath(expandTilde(opts.out));
-        const segments = p.split("/").filter(Boolean);
-        const target = join(cacheRoot, opts.drive, ...segments);
-        mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
-        chmodSync(dirname(target), 0o700);
+        const driveRoot = join(cacheRoot, opts.drive);
+        const target = join(driveRoot, ...p.split("/"));
+        // Defense in depth: nothing outside the cache root may be written,
+        // and a symlink at the leaf must not be followed.
+        if (!resolvePath(target).startsWith(resolvePath(driveRoot) + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
+        if (existsSync(target) && lstatSync(target).isSymbolicLink()) err(`Refusing to follow the symlink at ${target}`, "PATH_ESCAPE");
+        if (existsSync(dirname(target))) {
+          const realRoot = existsSync(driveRoot) ? realpathSync(driveRoot) : resolvePath(driveRoot);
+          if (!realpathSync(dirname(target)).startsWith(realRoot + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
+        }
 
+        const res = await checkRaw(await graphRawRequest(`${base}/root:/${enc}:/content`), p);
+        mkdirChmodChain(cacheRoot, dirname(target));
+
+        // Write to a temp file first, verify, then rename: a failed download
+        // never leaves a partial file behind that looks complete.
+        const tmp = join(dirname(target), `.${basename(target)}.part-${process.pid}-${Date.now()}`);
         const hash = createHash("sha256");
         let size = 0;
-        await pipeline(
-          Readable.fromWeb(res.body as any),
-          async function* (source) {
-            for await (const chunk of source) {
-              hash.update(chunk);
-              size += chunk.length;
-              yield chunk;
-            }
-          },
-          createWriteStream(target, { mode: 0o600 })
-        );
-        chmodSync(target, 0o600);
+        try {
+          await pipeline(
+            Readable.fromWeb(res.body as any),
+            async function* (source) {
+              for await (const chunk of source) {
+                hash.update(chunk);
+                size += chunk.length;
+                yield chunk;
+              }
+            },
+            createWriteStream(tmp, { flags: "wx", mode: 0o600 })
+          );
+          chmodSync(tmp, 0o600);
+          if (meta.size != null && size !== meta.size) {
+            throw new GraphError(0, `Downloaded ${size} bytes but Graph says the file is ${meta.size}`);
+          }
+          const remoteQxh = meta.file?.hashes?.quickXorHash;
+          if (remoteQxh && quickXorHashOf(tmp) !== remoteQxh) {
+            throw new GraphError(0, "Downloaded quickXorHash does not match the remote item");
+          }
+          renameSync(tmp, target);
+        } catch (e) {
+          try {
+            unlinkSync(tmp);
+          } catch {
+            // nothing to clean up
+          }
+          throw e;
+        }
 
         out({ drive: opts.drive, path: p, localPath: target, size, sha256: hash.digest("hex") });
       } catch (e: any) {
@@ -386,23 +547,36 @@ export function registerFiles(program: Command) {
         const base = await driveBase(opts.drive);
         const localDir = resolvePath(expandTilde(dir));
         if (!existsSync(localDir) || !statSync(localDir).isDirectory()) err(`No local folder: ${localDir}`, "LOCAL_MISSING");
+        // Validate the remote target the same way as every other subcommand.
+        const rootTarget = p === "/" || p.trim() === "";
+        if (!rootTarget) encPath(p); // throws BAD_PATH on dot/backslash/control segments
 
         const localFiles: string[] = [];
+        const skippedEntries: any[] = [];
         (function walk(d: string, rel: string) {
           for (const e of readdirSync(join(d, rel), { withFileTypes: true })) {
             if (e.name === ".DS_Store") continue;
             const r = rel ? `${rel}/${e.name}` : e.name;
             if (e.isDirectory()) walk(d, r);
             else if (e.isFile()) localFiles.push(r);
+            else skippedEntries.push({ file: r, skipped: e.isSymbolicLink() ? "symlink" : "special file" });
           }
         })(localDir, "");
         localFiles.sort();
 
+        // Case-only name collisions (OneDrive is case-insensitive; APFS cannot
+        // hold both spellings, so this catches them before anything uploads).
+        const caseCollisions = detectCaseCollisions(localFiles);
+
         const plan: any[] = [];
         let unchanged = 0;
         for (const rel of localFiles) {
-          const remoteRel = p ? `${p.replace(/\/+$/, "")}/${rel}` : rel;
+          const remoteRel = rootTarget ? rel : `${p.replace(/\/+$/, "")}/${rel}`;
           const st = statSync(join(localDir, rel));
+          if (caseCollisions.has(rel)) {
+            plan.push({ file: rel, remote: remoteRel, conflict: "case-only name collision with another local file; upload refused" });
+            continue;
+          }
           let remote: any = null;
           try {
             remote = await graphRequest(itemPath(base, remoteRel));
@@ -419,19 +593,33 @@ export function registerFiles(program: Command) {
           const hashes = remote?.file?.hashes || {};
           let hashMatches = false;
           if (hashes.quickXorHash) hashMatches = quickXorHashOf(join(localDir, rel)) === hashes.quickXorHash;
-          else if (hashes.sha1Hash) {
-            const localSha1 = createHash("sha1").update(readFileSync(join(localDir, rel))).digest("hex").toUpperCase();
-            hashMatches = localSha1 === String(hashes.sha1Hash).toUpperCase();
-          }
+          else if (hashes.sha1Hash) hashMatches = sha1Of(join(localDir, rel)) === String(hashes.sha1Hash).toUpperCase();
           const same = remote && remote.size === st.size && hashMatches;
           if (same) {
             unchanged++;
             continue;
           }
-          plan.push({ file: rel, remote: remoteRel, size: st.size, changed: !!remote });
+          const times = {
+            remoteModified: remote?.lastModifiedDateTime || null,
+            localModified: st.mtime.toISOString(),
+          };
+          if (!remote) {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, changed: false, ...times });
+            continue;
+          }
+          // A changed remote file is only replaced when the remote copy is
+          // older than the local one; a remote edit newer than local is a
+          // conflict that sync never overwrites.
+          const remoteNewer = remote.lastModifiedDateTime && new Date(remote.lastModifiedDateTime) > st.mtime;
+          if (remoteNewer) {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, conflict: "remote is newer than the local file", ...times });
+          } else {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, changed: true, eTag: remote.eTag, ...times });
+          }
         }
 
-        const toUpload = plan.filter((u) => !u.skipped);
+        for (const s of skippedEntries) plan.push(s);
+        const toUpload = plan.filter((u) => !u.skipped && !u.conflict && (u.changed || u.eTag === undefined));
         if (opts.apply) {
           try {
             await graphRequest(itemPath(base, p));
@@ -450,10 +638,21 @@ export function registerFiles(program: Command) {
                 await ensureFolder(base, dir);
               }
             }
-            const r = await uploadFile(base, u.remote, join(localDir, u.file), !!u.changed);
-            u.id = r.id;
-            u.sha256 = r.sha256;
-            u.uploadedVia = r.mode;
+            try {
+              // Replace only files we saw older remotes for, and send If-Match
+              // with the eTag from the plan so an item that changed after the
+              // plan fails with 412 instead of overwriting.
+              const r = await uploadFile(base, u.remote, join(localDir, u.file), !!u.changed, u.eTag);
+              u.id = r.id;
+              u.sha256 = r.sha256;
+              u.uploadedVia = r.mode;
+            } catch (e: any) {
+              if (e instanceof GraphError && e.status === 412) {
+                u.conflict = "remote changed during upload (412); skipped";
+                continue;
+              }
+              throw e;
+            }
           }
         }
 
@@ -463,8 +662,9 @@ export function registerFiles(program: Command) {
           remote: p,
           mode: opts.apply ? "apply" : "dry-run",
           scanned: localFiles.length,
-          uploads: toUpload.length,
+          uploads: toUpload.filter((u) => !u.conflict).length,
           unchanged,
+          conflicts: plan.filter((u) => u.conflict).length,
           files: plan,
         });
       } catch (e: any) {
