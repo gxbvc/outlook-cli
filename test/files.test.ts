@@ -414,3 +414,54 @@ test("sync requires exactly one of --dry-run or --apply", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Pinned QuickXorHash vectors, computed with the reference implementation
+// (@cloudraker/quickxorhash 1.1.0, a port of Microsoft's published
+// quickxorhash algorithm) on 2026-10-26. The port in src/quickxor.ts must
+// reproduce these exactly, or sync's change detection breaks.
+test("QuickXorHash matches Microsoft's published algorithm (pinned vectors)", async () => {
+  const { QuickXorHash } = await import("../src/quickxor.js");
+  const hash = (s: string) => { const q = new QuickXorHash(); q.update(Buffer.from(s, "utf8")); return q.digestBase64(); };
+  assert.equal(hash(""), "AAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+  assert.equal(hash("hello world"), "aCgDG9jwBhDc4Q1yawMZAAAAAAA=");
+  assert.equal(hash("The quick brown fox jumps over the lazy dog"), "bMSlbysmxJL6S75XwfMcQZOpcr4=");
+  // Streaming (64 KiB chunks) must agree with one-shot on a 5 MiB + 777 byte input.
+  const big = Buffer.alloc(5 * 1024 * 1024 + 777);
+  for (let i = 0; i < big.length; i++) big[i] = (i * 31 + 17) % 251;
+  const one = new QuickXorHash(); one.update(big);
+  const streamed = new QuickXorHash();
+  for (let off = 0; off < big.length; off += 65536) streamed.update(big.subarray(off, Math.min(off + 65536, big.length)));
+  assert.equal(one.digestBase64(), streamed.digestBase64());
+});
+
+test("sync compares quickXorHash (business drives) and falls back to sha1", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odqxh-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "same.txt"), "same");
+    writeFileSync(join(src, "differs.txt"), "same");
+    writeFileSync(join(src, "sha1only.txt"), "same");
+    const { QuickXorHash } = await import("../src/quickxor.js");
+    const q = new QuickXorHash(); q.update(Buffer.from("same"));
+    const qxh = q.digestBase64();
+    const sha1 = (s: string) => createHash("sha1").update(s).digest("hex").toUpperCase();
+    remoteItems = {
+      "syncdst/same.txt": { name: "same.txt", id: "S1", size: 4, file: { hashes: { quickXorHash: qxh } } },
+      "syncdst/differs.txt": { name: "differs.txt", id: "D1", size: 4, file: { hashes: { quickXorHash: "WRONGQXH=" } } },
+      // personal OneDrive shape: sha1Hash only
+      "syncdst/sha1only.txt": { name: "sha1only.txt", id: "H1", size: 4, file: { hashes: { sha1Hash: sha1("same") } } },
+      // no hashes at all: counts as changed (re-upload)
+      "syncdst/nohash.txt": { name: "nohash.txt", id: "N1", size: 4, file: { hashes: {} } },
+    };
+    writeFileSync(join(src, "nohash.txt"), "same");
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.data.unchanged, 2, "same.txt (quickXorHash) and sha1only.txt (sha1 fallback) are unchanged");
+    assert.deepEqual(
+      o.data.files.filter((f: any) => !f.skipped).map((f: any) => f.file).sort(),
+      ["differs.txt", "nohash.txt"]
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

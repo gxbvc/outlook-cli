@@ -7,6 +7,7 @@ import { dirname, join, resolve as resolvePath } from "path";
 import { homedir } from "os";
 import { TOKENS_DIR } from "../config.js";
 import { GraphError, graphRawRequest, graphRequest, out, err } from "../graph.js";
+import { QuickXorHash } from "../quickxor.js";
 
 // OneDrive and SharePoint files via Graph. Read only: search, ls, info, get.
 // Needs Files.Read.All and Sites.Read.All (delegated); re-run `outlook-cli auth`
@@ -204,6 +205,25 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
   return { id: item.id, size: total, sha256: hash.digest("hex"), mode: "session" };
 }
 
+// OneDrive for Business and SharePoint return only quickXorHash in
+// file.hashes (sha1Hash is personal OneDrive only), so this is the primary
+// comparison for sync. Streamed off disk; never the whole file in memory.
+function quickXorHashOf(localPath: string): string {
+  const q = new QuickXorHash();
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      q.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return q.digestBase64();
+}
+
 export function registerFiles(program: Command) {
   const files = program.command("files").description("OneDrive and SharePoint files (read only)");
 
@@ -353,7 +373,7 @@ export function registerFiles(program: Command) {
   files
     .command("sync")
     .description(
-      "Mirror a local folder into the drive: uploads only new or changed files (size + sha1 compared against Graph). Never deletes remote files."
+      "Mirror a local folder into the drive: uploads only new or changed files (size + quickXorHash compared against Graph, sha1 fallback). Never deletes remote files."
     )
     .argument("<dir>", "Local folder to upload")
     .argument("<path>", "Remote target folder relative to the drive root")
@@ -383,7 +403,6 @@ export function registerFiles(program: Command) {
         for (const rel of localFiles) {
           const remoteRel = p ? `${p.replace(/\/+$/, "")}/${rel}` : rel;
           const st = statSync(join(localDir, rel));
-          const localSha1 = createHash("sha1").update(readFileSync(join(localDir, rel))).digest("hex").toUpperCase();
           let remote: any = null;
           try {
             remote = await graphRequest(itemPath(base, remoteRel));
@@ -394,8 +413,17 @@ export function registerFiles(program: Command) {
             plan.push({ file: rel, remote: remoteRel, skipped: "remote path is a folder; never replaced" });
             continue;
           }
-          const same =
-            remote && remote.size === st.size && String(remote.file?.hashes?.sha1Hash || "").toUpperCase() === localSha1;
+          // OneDrive for Business/SharePoint give quickXorHash only; personal
+          // OneDrive also has sha1Hash. Prefer quickXorHash, fall back to sha1;
+          // a remote item with neither hash counts as changed (re-upload).
+          const hashes = remote?.file?.hashes || {};
+          let hashMatches = false;
+          if (hashes.quickXorHash) hashMatches = quickXorHashOf(join(localDir, rel)) === hashes.quickXorHash;
+          else if (hashes.sha1Hash) {
+            const localSha1 = createHash("sha1").update(readFileSync(join(localDir, rel))).digest("hex").toUpperCase();
+            hashMatches = localSha1 === String(hashes.sha1Hash).toUpperCase();
+          }
+          const same = remote && remote.size === st.size && hashMatches;
           if (same) {
             unchanged++;
             continue;

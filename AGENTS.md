@@ -72,7 +72,7 @@ outlook-cli files ls PATH [--drive me|ricky]          # list a folder; paths rel
 outlook-cli files info PATH [--drive me|ricky]        # one item's metadata, never file contents
 outlook-cli files get PATH [--drive me|ricky] [--out DIR]  # stream-download to cache (default ~/tmp/onedrive-cache, mode 700/600); prints localPath, size, sha256
 outlook-cli files put LOCAL PATH [--drive me|ricky] [--force] [--mkdir]  # upload one file; ALREADY_EXISTS without --force (--force replaces files only, never folders); files >4 MiB go through a 5 MiB-chunk upload session
-outlook-cli files sync LOCAL_DIR PATH [--drive me|ricky] --dry-run|--apply  # mirror up: only new/changed files (size + sha1 vs Graph); never deletes remote; --dry-run plans only
+outlook-cli files sync LOCAL_DIR PATH [--drive me|ricky] --dry-run|--apply  # mirror up: only new/changed files (size + quickXorHash vs Graph, sha1 fallback); never deletes remote; --dry-run plans only
 # --drive me = your OneDrive (/me/drive); --drive ricky = shared library "Ricky Bureau - GXB"
 # (drive id resolved once via site search, cached in tokens/drive-ids.json). No move/delete commands.
 
