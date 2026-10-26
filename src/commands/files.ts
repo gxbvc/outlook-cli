@@ -43,7 +43,20 @@ function writeDriveCache(cache: Record<string, string>): void {
 
 async function rickyDriveId(): Promise<string> {
   const cache = readDriveCache();
-  if (cache[SHARED_LIBRARY_NAME]) return cache[SHARED_LIBRARY_NAME];
+  const cached = cache[SHARED_LIBRARY_NAME];
+  if (cached) {
+    // Re-verify the cached id once per run: a stale id (for example one cached
+    // by the old first-hit fallback) must never be written through.
+    try {
+      const drive = await graphRequest(`/drives/${cached}`);
+      if (drive?.name === SHARED_LIBRARY_NAME) return cached;
+    } catch (e: any) {
+      if (!(e instanceof GraphError)) throw e;
+      // 404 or access error: treat as stale and re-resolve below.
+    }
+    delete cache[SHARED_LIBRARY_NAME];
+    writeDriveCache(cache);
+  }
   const sites = await graphRequest(`/sites?search=${encodeURIComponent(SHARED_LIBRARY_NAME)}`);
   // Exact library name only. A fuzzy or first-hit fallback would cache the
   // wrong drive id and later puts/syncs would write into an unrelated library.
@@ -66,14 +79,29 @@ async function driveBase(drive: string): Promise<string> {
 // Encode each path segment so spaces, #, % and unicode survive the URL, but
 // first reject anything that could escape the drive or the local cache: empty
 // segments, ".", "..", backslashes and control characters. WHATWG URL parsing
-// would otherwise resolve dot segments out of the encoded path.
-function encPath(rel: string): string {
-  const segs = rel.split("/");
-  for (const seg of segs) {
-    if (!seg || seg === "." || seg === "..") err(`Bad path segment "${seg}" in "${rel}"`, "BAD_PATH");
-    if (seg.includes("\\") || /[\u0000-\u001f\u007f]/.test(seg)) err(`Bad character in path segment "${seg}"`, "BAD_PATH");
+// would otherwise resolve dot segments out of the encoded path. ONE leading
+// and ONE trailing "/" are allowed and stripped; "" or "/" means the root.
+function badSegmentReason(rel: string): string | null {
+  for (const seg of rel.split("/")) {
+    if (!seg || seg === "." || seg === "..") return `bad path segment "${seg}"`;
+    if (seg.includes("\\") || /[\u0000-\u001f\u007f]/.test(seg)) return `bad character in path segment "${seg}"`;
   }
-  return segs.map(encodeURIComponent).join("/");
+  return null;
+}
+
+function normalizeRel(rel: string): string {
+  let p = rel;
+  if (p.startsWith("/")) p = p.slice(1);
+  if (p.endsWith("/")) p = p.slice(0, -1);
+  return p;
+}
+
+function encPath(rel: string): string {
+  const p = normalizeRel(rel);
+  if (p === "") return "";
+  const reason = badSegmentReason(p);
+  if (reason) err(`Bad path: ${reason} in "${rel}"`, "BAD_PATH");
+  return p.split("/").map(encodeURIComponent).join("/");
 }
 
 // Graph item path relative to the drive root ("root:/segment/segment").
@@ -127,6 +155,7 @@ function expandTilde(p: string): string {
 
 // Create the folder chain from root down to dir and chmod every level 700 —
 // a cache root or drive folder that already existed keeps its old mode otherwise.
+// Never follows a symlink: refuses instead.
 function mkdirChmodChain(root: string, dir: string): void {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -135,6 +164,7 @@ function mkdirChmodChain(root: string, dir: string): void {
   let cur = root;
   for (const seg of rel.split(sep).filter(Boolean)) {
     cur = join(cur, seg);
+    if (existsSync(cur) && lstatSync(cur).isSymbolicLink()) err(`Refusing to follow the symlink at ${cur}`, "PATH_ESCAPE");
     mkdirSync(cur, { recursive: true, mode: 0o700 });
     chmodSync(cur, 0o700);
   }
@@ -189,17 +219,42 @@ function sha1Of(localPath: string): string {
   return hash.digest("hex").toUpperCase();
 }
 
+// Honor Graph's Retry-After (seconds or HTTP-date), capped at 60 s; fall back
+// to exponential backoff when the header is absent.
+export function retryDelayMs(header: string | null, attempt: number): number {
+  const CAP = 60_000;
+  if (header) {
+    const secs = parseInt(header, 10);
+    if (!isNaN(secs)) return Math.min(secs * 1000, CAP);
+    const at = Date.parse(header);
+    if (!isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), CAP);
+  }
+  return Math.min(200 * 2 ** attempt, CAP);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // Upload one local file. Small: single PUT with conflictBehavior on the URL.
 // Large: an upload session, streamed one chunk at a time (never the whole file
-// in memory), chunks retried on 429/5xx with Retry-After (max 3), the session
-// cancelled on final failure. Hashes while sending; refuses when the local
-// file changes size during the upload.
+// in memory), chunks retried on 429/5xx/network errors with Retry-After (max
+// 3), the session cancelled on final failure. Hashes while sending; refuses
+// when the local file changes size during the upload; verifies the stored
+// quickXorHash against the local one when Graph reports it.
 async function uploadFile(base: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
   const startSize = statSync(localPath).size;
   const hash = createHash("sha256");
   const enc = encPath(rel);
   const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
   if (ifMatch) headers["If-Match"] = ifMatch;
+
+  const checkStoredHash = (item: any) => {
+    const remoteQxh = item?.file?.hashes?.quickXorHash;
+    if (remoteQxh && remoteQxh !== quickXorHashOf(localPath)) {
+      err(`Uploaded quickXorHash mismatch for "${rel}"; the upload did not round-trip`, "UPLOAD_HASH_MISMATCH");
+    }
+  };
 
   if (startSize <= UPLOAD_SESSION_THRESHOLD) {
     const data = readFileSync(localPath);
@@ -214,6 +269,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
       rel
     );
     const item = await res.json();
+    checkStoredHash(item);
     return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "simple", eTag: item.eTag };
   }
 
@@ -257,14 +313,26 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
 
     let attempt = 0;
     for (;;) {
-      const chunkRes = await graphRawRequest(uploadUrl, {
-        method: "PUT",
-        headers: {
-          "Content-Length": String(chunk.length),
-          "Content-Range": `bytes ${start}-${start + chunk.length - 1}/${startSize}`,
-        },
-        body: chunk,
-      });
+      let chunkRes: Response;
+      try {
+        chunkRes = await graphRawRequest(uploadUrl, {
+          method: "PUT",
+          headers: {
+            "Content-Length": String(chunk.length),
+            "Content-Range": `bytes ${start}-${start + chunk.length - 1}/${startSize}`,
+          },
+          body: chunk,
+        });
+      } catch (e: any) {
+        // A network error (fetch rejects) retries like a 5xx.
+        if (attempt < 3) {
+          attempt++;
+          await sleep(retryDelayMs(null, attempt));
+          continue;
+        }
+        await cancelSession();
+        throw new GraphError(0, `Network error on chunk ${start}-${start + chunk.length - 1} after ${attempt} retries: ${e?.message || e}`);
+      }
       if (chunkRes.ok) {
         sent += chunk.length;
         const text = await chunkRes.text();
@@ -283,8 +351,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
       const retryable = chunkRes.status === 429 || chunkRes.status >= 500;
       if (retryable && attempt < 3) {
         attempt++;
-        const delay = retryAfter ? parseInt(retryAfter, 10) * 1000 : 200 * 2 ** attempt;
-        await new Promise((r) => setTimeout(r, Math.min(delay, 5000)));
+        await sleep(retryDelayMs(retryAfter, attempt));
         continue;
       }
       await cancelSession();
@@ -300,11 +367,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
     err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
   }
   if (!item) err("Upload finished but Graph returned no drive item", "UPLOAD_INCOMPLETE");
-  // Verify what Graph stored against what we sent.
-  const remoteQxh = item.file?.hashes?.quickXorHash;
-  if (remoteQxh && remoteQxh !== quickXorHashOf(localPath)) {
-    err(`Uploaded quickXorHash mismatch for "${rel}"; the upload did not round-trip`, "UPLOAD_HASH_MISMATCH");
-  }
+  checkStoredHash(item);
   return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "session", eTag: item.eTag };
 }
 
@@ -342,6 +405,31 @@ export function detectCaseCollisions(rels: string[]): Set<string> {
     }
   }
   return collisions;
+}
+
+// Per-target sync state: the eTag each remote file had at its last successful
+// sync. A remote whose eTag differs from the stored one changed since then —
+// even when it looks older — so both-sides-edited becomes a conflict.
+function syncStateDir(): string {
+  return process.env.OUTLOOK_SYNC_STATE_DIR || join(homedir(), ".config", "outlook-cli", "sync-state");
+}
+
+function syncStateFile(drive: string, target: string): string {
+  const h = createHash("sha256").update(`${drive}:${target}`).digest("hex").slice(0, 16);
+  return join(syncStateDir(), `${drive}-${h}.json`);
+}
+
+function readSyncState(file: string): Record<string, { eTag?: string; syncedAt?: string }> {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeSyncState(file: string, state: Record<string, { eTag?: string; syncedAt?: string }>): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
 
 export function registerFiles(program: Command) {
@@ -427,19 +515,25 @@ export function registerFiles(program: Command) {
         if (meta.folder) err("That path is a folder; `files get` works on files only", "IS_FOLDER");
 
         const cacheRoot = resolvePath(expandTilde(opts.out));
-        const driveRoot = join(cacheRoot, opts.drive);
+        mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+        // The cache root itself is the user's choice: resolve it once through
+        // any symlinks. Every level below it must be symlink-free.
+        const realRoot = realpathSync(cacheRoot);
+        const driveRoot = join(realRoot, opts.drive);
         const target = join(driveRoot, ...p.split("/"));
-        // Defense in depth: nothing outside the cache root may be written,
-        // and a symlink at the leaf must not be followed.
-        if (!resolvePath(target).startsWith(resolvePath(driveRoot) + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
-        if (existsSync(target) && lstatSync(target).isSymbolicLink()) err(`Refusing to follow the symlink at ${target}`, "PATH_ESCAPE");
-        if (existsSync(dirname(target))) {
-          const realRoot = existsSync(driveRoot) ? realpathSync(driveRoot) : resolvePath(driveRoot);
-          if (!realpathSync(dirname(target)).startsWith(realRoot + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
+        let cur = driveRoot;
+        for (const seg of relative(driveRoot, dirname(target)).split(sep).filter(Boolean)) {
+          cur = join(cur, seg);
+          if (existsSync(cur)) {
+            if (lstatSync(cur).isSymbolicLink()) err(`Refusing to follow the symlink at ${cur}`, "PATH_ESCAPE");
+            if (!statSync(cur).isDirectory()) err(`Not a folder: ${cur}`, "PATH_ESCAPE");
+          }
         }
+        if (existsSync(target) && lstatSync(target).isSymbolicLink()) err(`Refusing to follow the symlink at ${target}`, "PATH_ESCAPE");
 
         const res = await checkRaw(await graphRawRequest(`${base}/root:/${enc}:/content`), p);
-        mkdirChmodChain(cacheRoot, dirname(target));
+        mkdirChmodChain(realRoot, dirname(target));
+        if (!realpathSync(dirname(target)).startsWith(realRoot + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
 
         // Write to a temp file first, verify, then rename: a failed download
         // never leaves a partial file behind that looks complete.
@@ -548,8 +642,13 @@ export function registerFiles(program: Command) {
         const localDir = resolvePath(expandTilde(dir));
         if (!existsSync(localDir) || !statSync(localDir).isDirectory()) err(`No local folder: ${localDir}`, "LOCAL_MISSING");
         // Validate the remote target the same way as every other subcommand.
-        const rootTarget = p === "/" || p.trim() === "";
-        if (!rootTarget) encPath(p); // throws BAD_PATH on dot/backslash/control segments
+        // One leading and one trailing "/" are allowed and stripped; "/" is the drive root.
+        const rootTarget = normalizeRel(p) === "";
+        const normalizedTarget = rootTarget ? "/" : normalizeRel(p);
+        if (!rootTarget) encPath(normalizedTarget); // throws BAD_PATH on dot/backslash/control segments
+
+        const stateFile = syncStateFile(opts.drive, normalizedTarget);
+        const state = readSyncState(stateFile);
 
         const localFiles: string[] = [];
         const skippedEntries: any[] = [];
@@ -571,7 +670,14 @@ export function registerFiles(program: Command) {
         const plan: any[] = [];
         let unchanged = 0;
         for (const rel of localFiles) {
-          const remoteRel = rootTarget ? rel : `${p.replace(/\/+$/, "")}/${rel}`;
+          const remoteRel = rootTarget ? rel : `${normalizedTarget}/${rel}`;
+          // One bad local file name (a backslash or control character is legal
+          // on macOS) is skipped and reported, not an abort of the whole sync.
+          const badName = badSegmentReason(remoteRel);
+          if (badName) {
+            plan.push({ file: rel, remote: remoteRel, skipped: `bad file name: ${badName}` });
+            continue;
+          }
           const st = statSync(join(localDir, rel));
           if (caseCollisions.has(rel)) {
             plan.push({ file: rel, remote: remoteRel, conflict: "case-only name collision with another local file; upload refused" });
@@ -597,6 +703,9 @@ export function registerFiles(program: Command) {
           const same = remote && remote.size === st.size && hashMatches;
           if (same) {
             unchanged++;
+            // Identical content: record the remote's current eTag as the
+            // last-synced one (apply only; dry-run never writes state).
+            if (opts.apply && remote.eTag) state[remoteRel] = { eTag: remote.eTag, syncedAt: new Date().toISOString() };
             continue;
           }
           const times = {
@@ -605,6 +714,20 @@ export function registerFiles(program: Command) {
           };
           if (!remote) {
             plan.push({ file: rel, remote: remoteRel, size: st.size, changed: false, ...times });
+            continue;
+          }
+          // Both-sides-edited guard: a remote whose eTag differs from the one
+          // recorded at the last sync changed since then, even when it looks
+          // older. First sync with no stored state falls back to the mtime rule.
+          const stored = state[remoteRel];
+          if (stored?.eTag && remote.eTag && stored.eTag !== remote.eTag) {
+            plan.push({
+              file: rel,
+              remote: remoteRel,
+              size: st.size,
+              conflict: "remote changed since the last sync (eTag differs from the stored one)",
+              ...times,
+            });
             continue;
           }
           // A changed remote file is only replaced when the remote copy is
@@ -622,10 +745,10 @@ export function registerFiles(program: Command) {
         const toUpload = plan.filter((u) => !u.skipped && !u.conflict && (u.changed || u.eTag === undefined));
         if (opts.apply) {
           try {
-            await graphRequest(itemPath(base, p));
+            await graphRequest(itemPath(base, normalizedTarget));
           } catch (e: any) {
             if (!isNotFound(e)) throw e;
-            await ensureFolder(base, p.split("/").filter(Boolean));
+            await ensureFolder(base, normalizedTarget.split("/").filter(Boolean));
           }
           for (const u of toUpload) {
             const relSegments = u.remote.split("/").filter(Boolean);
@@ -646,6 +769,7 @@ export function registerFiles(program: Command) {
               u.id = r.id;
               u.sha256 = r.sha256;
               u.uploadedVia = r.mode;
+              if (r.eTag) state[u.remote] = { eTag: r.eTag, syncedAt: new Date().toISOString() };
             } catch (e: any) {
               if (e instanceof GraphError && e.status === 412) {
                 u.conflict = "remote changed during upload (412); skipped";
@@ -667,6 +791,7 @@ export function registerFiles(program: Command) {
           conflicts: plan.filter((u) => u.conflict).length,
           files: plan,
         });
+        if (opts.apply) writeSyncState(stateFile, state);
       } catch (e: any) {
         graphFail(e);
       }

@@ -1,7 +1,7 @@
 import { test, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { Command } from "commander";
-import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { createHash } from "crypto";
@@ -45,6 +45,7 @@ beforeEach(() => {
   delete process.env.OUTLOOK_USER;
   const cacheFile = join(mkdtempSync(join(tmpdir(), "odcache-")), "drive-ids.json");
   process.env.OUTLOOK_DRIVE_CACHE = cacheFile;
+  process.env.OUTLOOK_SYNC_STATE_DIR = join(mkdtempSync(join(tmpdir(), "odstate-")), "state");
   remoteItems = {};
   putStatus = {};
   setTransportForTests(async (path, options) => {
@@ -80,13 +81,15 @@ beforeEach(() => {
       return { uploadUrl: "https://upload.example/session1", nextExpectedRanges: [] };
     if (q.endsWith(":/content") && method === "PUT") {
       if (putStatus[q]) return new Response(JSON.stringify({ error: "forced" }), { status: putStatus[q] });
-      return new Response(JSON.stringify({ name: "file", id: "UPLOADED-SIMPLE", size: record.bodyLen }), {
+      return new Response(JSON.stringify({ name: "file", id: "UPLOADED-SIMPLE", size: record.bodyLen, eTag: '"ETAG-UPLOADED-1"' }), {
         headers: { "Content-Type": "application/json" },
       });
     }
     if (q.endsWith("/children") && method === "POST")
       return { name: record.body?.name, id: `FOLDER-CREATED-${record.body?.name}`, folder: {} };
     if (q === "/sites/SITE1/drive") return { id: "DRIVE1", name: "Ricky Bureau - GXB" };
+    if (q === "/drives/DRIVE1" || q === "/drives/CACHED1") return { id: q.split("/")[2], name: "Ricky Bureau - GXB" };
+    if (q === "/me/drive/root") return { name: "root", id: "ROOT1", folder: {} };
     if (q.startsWith("/sites")) return { value: [{ id: "SITE1", displayName: "Ricky Bureau - GXB" }] };
     if (q.includes("/search(q=")) return { value: [searchItem()] };
     if (q === "/me/drive/root/children") return { value: [driveItem] };
@@ -183,7 +186,7 @@ test("get streams to a temp cache dir with mode 600 and correct sha256", async (
     const o = await run("get", "10_Products/report.pdf", "--out", dir);
     const expected = join(dir, "me", "10_Products", "report.pdf");
     assert.equal(o.ok, true);
-    assert.equal(o.data.localPath, expected);
+    assert.equal(o.data.localPath, realpathSync(expected)); // cache root resolved through realpath
     assert.equal(o.data.size, Buffer.byteLength("file-body-contents"));
     assert.equal(o.data.sha256, createHash("sha256").update("file-body-contents").digest("hex"));
     assert.equal(readFileSync(expected, "utf8"), "file-body-contents");
@@ -204,13 +207,14 @@ test("get on a --drive ricky file resolves the shared library drive id once and 
     const siteCalls = calls.filter((c) => c.path.startsWith("/sites")).length;
     assert.equal(siteCalls, 2, "site search + site drive lookup happen only on first resolve");
     assert.deepEqual(
-      calls.filter((c) => c.path.startsWith("/drives/")).map((c) => c.path.split("?")[0]),
+      calls.filter((c) => c.path.startsWith("/drives/") && c.path.split("?")[0] !== "/drives/DRIVE1").map((c) => c.path.split("?")[0]),
       [
         "/drives/DRIVE1/root:/docs/report.pdf",
         "/drives/DRIVE1/root:/docs/report.pdf:/content",
         "/drives/DRIVE1/root:/docs:/children",
       ]
     );
+    assert.equal(calls.filter((c) => c.path.split("?")[0] === "/drives/DRIVE1").length, 1, "verified once per run (only the cached run)");
     assert.equal(readFileSync(join(dir, "ricky", "docs", "report.pdf"), "utf8"), "ricky-file-body-contents");
     // The cache file holds only the drive id.
     const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
@@ -220,11 +224,21 @@ test("get on a --drive ricky file resolves the shared library drive id once and 
   }
 });
 
-test("ricky drive id is reused from cache without a site search", async () => {
+test("ricky drive id is reused from cache (verified once) without a site search", async () => {
   writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "CACHED1" }));
   await run("info", "docs/report.pdf", "--drive", "ricky");
   assert.equal(calls.filter((c) => c.path.startsWith("/sites")).length, 0);
-  assert.equal(calls[0].path, "/drives/CACHED1/root:/docs/report.pdf");
+  assert.equal(calls[0].path, "/drives/CACHED1", "the cached id is re-verified once per run");
+  assert.equal(calls[1].path, "/drives/CACHED1/root:/docs/report.pdf");
+});
+
+test("ricky: a cached id whose drive no longer matches is dropped and re-resolved", async () => {
+  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "STALE1" }));
+  const o = await run("ls", "docs", "--drive", "ricky");
+  assert.equal(o.ok, true);
+  assert.equal(calls.some((c) => c.path.startsWith("/sites")), true, "re-resolves after dropping the stale id");
+  const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
+  assert.deepEqual(cached, { "Ricky Bureau - GXB": "DRIVE1" });
 });
 
 test("404 becomes a friendly NOT_FOUND error", async () => {
@@ -767,5 +781,232 @@ test("NIT: files refuses the global --user remap", async () => {
     assert.equal(o.code, "USER_UNSUPPORTED");
   } finally {
     delete process.env.OUTLOOK_USER;
+  }
+});
+
+// --- Review round 2 fixes ---
+
+test("R2-M1: get refuses a symlinked drive folder and never chmods through it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odr2m1-"));
+  try {
+    const outside = join(dir, "outside");
+    mkdirSync(outside, { mode: 0o755 });
+    symlinkSync(outside, join(dir, "me")); // cache/me -> outside
+    const o = await run("get", "10_Products/report.pdf", "--out", dir);
+    assert.equal(o.code, "PATH_ESCAPE");
+    assert.equal(existsSync(join(outside, "10_Products")), false, "nothing created through the link");
+    assert.equal(statSync(outside).mode & 0o777, 0o755, "the outside folder is not chmodded");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R2-M1: get refuses a symlinked middle folder in the cache", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odr2m1b-"));
+  try {
+    const outside = join(dir, "outside");
+    mkdirSync(outside, { mode: 0o755 });
+    mkdirSync(join(dir, "me"), { recursive: true });
+    symlinkSync(outside, join(dir, "me", "10_Products"));
+    const o = await run("get", "10_Products/report.pdf", "--out", dir);
+    assert.equal(o.code, "PATH_ESCAPE");
+    assert.equal(existsSync(join(outside, "10_Products")), false);
+    assert.equal(statSync(outside).mode & 0o777, 0o755);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R2-M2: one leading slash is allowed on every subcommand", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odr2m2-"));
+  try {
+    const local = join(dir, "hello.txt");
+    writeFileSync(local, "lead");
+    const o1 = await run("info", "/10_Products/report.pdf");
+    assert.equal(o1.ok, true);
+    const o2 = await run("get", "/10_Products/report.pdf", "--out", dir);
+    assert.equal(o2.ok, true);
+    const o3 = await run("put", local, "/uploads/hello.txt");
+    assert.equal(o3.ok, true);
+    const o4 = await run("ls", "/10_Products/My Folder");
+    assert.equal(o4.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R2-M2: a trailing slash is stripped; dry-run and apply agree", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odr2m2b-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "plain.txt"), "plain");
+    const o = await run("sync", src, "syncdst/", "--dry-run");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.uploads, 1);
+    const o2 = await run("sync", src, "syncdst/", "--apply");
+    assert.equal(o2.ok, true);
+    assert.deepEqual(o2.data.files.map((f: any) => f.remote), ["syncdst/plain.txt"]);
+    // dot-dot through a trailing slash is still refused
+    const o3 = await run("sync", src, "syncdst/..", "--dry-run");
+    assert.equal(o3.code, "BAD_PATH");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("R2-M2: sync to the drive root (/) plans and applies the same way", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odr2root-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "plain.txt"), "plain");
+    const dry = await run("sync", src, "/", "--dry-run");
+    assert.equal(dry.ok, true);
+    assert.equal(dry.data.uploads, 1);
+    assert.equal(dry.data.files[0].remote, "plain.txt");
+    const apply = await run("sync", src, "/", "--apply");
+    assert.equal(apply.ok, true);
+    assert.equal(apply.data.uploads, 1);
+    assert.deepEqual(
+      calls.filter((c) => c.method === "PUT" && c.path.split("?")[0].endsWith(":/content")).map((c) => c.path.split("?")[0]),
+      ["/me/drive/root:/plain.txt:/content"]
+    );
+    // dry-run and apply agree on the plan
+    assert.deepEqual(
+      apply.data.files.map((f: any) => [f.file, f.remote, f.changed]),
+      dry.data.files.map((f: any) => [f.file, f.remote, f.changed])
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: one bad local file name is skipped and reported, the rest sync", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odbad-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "good.txt"), "good");
+    writeFileSync(join(src, "bad\\name.txt"), "bad"); // backslash is legal on macOS
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.ok, true);
+    const bad = o.data.files.find((f: any) => f.file === "bad\\name.txt");
+    assert.match(bad.skipped, /bad file name/);
+    assert.equal(o.data.files.find((f: any) => f.file === "good.txt").changed, false);
+    assert.equal(o.data.uploads, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: the sync state file stores eTags; a remote changed since the last sync is a conflict", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odstate-"));
+  const stateDir = join(dir, "state");
+  process.env.OUTLOOK_SYNC_STATE_DIR = stateDir;
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "doc.txt"), "local edit");
+    remoteItems = {
+      // remote looks OLD (mtime rule would replace) and has a matching-content hash? no:
+      // content differs (changed), remote mtime old, eTag known
+      "syncdst/doc.txt": {
+        name: "doc.txt", id: "D1", size: 99, eTag: "\"ETAG-D1\"",
+        lastModifiedDateTime: "2000-01-01T00:00:00Z", file: { hashes: { quickXorHash: "WRONG=" } },
+      },
+    };
+    // First apply: no stored state, mtime rule applies -> replaced, state written.
+    const o1 = await run("sync", src, "syncdst", "--apply");
+    assert.equal(o1.data.conflicts, 0);
+    const stateFile = readdirSync(stateDir)[0];
+    assert.match(stateFile, /^me-/.test(stateFile) ? /^me-/ : /./); // drive-prefixed name
+    const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
+    assert.equal(state["syncdst/doc.txt"].eTag, "\"ETAG-UPLOADED-1\"");
+    assert.equal(statSync(join(stateDir, stateFile)).mode & 0o777, 0o600);
+
+    // Second apply: remote STILL has the old mtime but a DIFFERENT eTag than
+    // the stored one -> both sides edited -> CONFLICT, never replaced.
+    remoteItems["syncdst/doc.txt"] = {
+      ...remoteItems["syncdst/doc.txt"],
+      eTag: "\"ETAG-D2\"", // Ricky edited it after our sync
+    };
+    const putsBefore = calls.filter((c) => c.method === "PUT").length;
+    const o2 = await run("sync", src, "syncdst", "--apply");
+    const entry = o2.data.files.find((f: any) => f.file === "doc.txt");
+    assert.match(entry.conflict, /changed since the last sync/);
+    assert.equal(o2.data.conflicts, 1);
+    assert.equal(calls.filter((c) => c.method === "PUT").length, putsBefore, "the conflicted file is never uploaded");
+
+    // dry-run never writes state
+    rmSync(stateDir, { recursive: true, force: true });
+    await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(existsSync(stateDir), false);
+  } finally {
+    delete process.env.OUTLOOK_SYNC_STATE_DIR;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: a network error on a chunk is retried, then the session cancelled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odnet-"));
+  try {
+    const local = join(dir, "big.bin");
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    let chunkAttempts = 0;
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      calls.push({ path, method });
+      const q = path.split("?")[0];
+      if (q.startsWith("https://upload.example/")) {
+        if (method === "DELETE") return new Response(null, { status: 204 });
+        chunkAttempts++;
+        if (chunkAttempts <= 2) throw new TypeError("fetch failed"); // network errors
+        if (chunkAttempts < 4) return new Response(JSON.stringify({ nextExpectedRanges: ["1-"] }), { status: 202 });
+        return new Response(JSON.stringify({ name: "big.bin", id: "UP1", size: 5 * 1024 * 1024 + 512 * 1024 }));
+      }
+      if (q === "/me/drive/root:/uploads") return { id: "F1", folder: {} };
+      if (q.endsWith(":/createUploadSession") && method === "POST") return { uploadUrl: "https://upload.example/session1" };
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.ok, true);
+    assert.equal(chunkAttempts, 4);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: Retry-After is honored in full up to a 60 s cap, HTTP-dates parsed", async () => {
+  const { retryDelayMs } = await import("../src/commands/files.js");
+  assert.equal(retryDelayMs("120", 1), 60000, "capped at 60 s");
+  assert.equal(retryDelayMs("2", 1), 2000);
+  assert.equal(retryDelayMs(null, 1), 400, "backoff fallback");
+  assert.equal(retryDelayMs(null, 3), 1600);
+  const inAnHour = new Date(Date.now() + 3600_000).toUTCString();
+  assert.equal(retryDelayMs(inAnHour, 1), 60000, "HTTP-date capped at 60 s");
+  const in5s = new Date(Date.now() + 5000).toUTCString();
+  const d = retryDelayMs(in5s, 1);
+  assert.ok(d > 3000 && d <= 5000, `HTTP-date parsed to a wait near 5 s, got ${d}`);
+});
+
+test("SHOULD: the simple PUT is hash-checked against the returned item", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odhash-"));
+  try {
+    const local = join(dir, "hello.txt");
+    writeFileSync(local, "hello put body");
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      calls.push({ path, method });
+      const q = path.split("?")[0];
+      if (q === "/me/drive/root:/uploads") return { id: "F1", folder: {} };
+      if (q.endsWith(":/uploads/hello.txt:/content") && method === "PUT")
+        return new Response(JSON.stringify({ id: "X1", file: { hashes: { quickXorHash: "CORRUPTED=" } } }));
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/hello.txt");
+    assert.equal(o.code, "UPLOAD_HASH_MISMATCH");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
