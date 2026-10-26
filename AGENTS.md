@@ -65,6 +65,14 @@ outlook-cli meetings transcript --event-id EVENT_ID [--since ISO] [--until ISO] 
 # Meetings another company organized give MEETING_NOT_FOUND or 403. Meetings older than about 60 days
 # give 404 "3004: Specified meeting is not found" (the online meeting expired);
 # a meeting without transcription gives NO_TRANSCRIPT.
+# OneDrive / SharePoint files (read only; needs Files.Read.All + Sites.Read.All consent, then re-run auth)
+outlook-cli files search QUERY [--drive me|ricky]     # search a drive; slim results (name, id, size, path, hash)
+outlook-cli files ls PATH [--drive me|ricky]          # list a folder; paths relative to drive root (e.g. 10_Products)
+outlook-cli files info PATH [--drive me|ricky]        # one item's metadata, never file contents
+outlook-cli files get PATH [--drive me|ricky] [--out DIR]  # stream-download to cache (default ~/tmp/onedrive-cache, mode 700/600); prints localPath, size, sha256
+# --drive me = your OneDrive (/me/drive); --drive ricky = shared library "Ricky Bureau - GXB"
+# (drive id resolved once via site search, cached in tokens/drive-ids.json). Read only: no put/move/delete.
+
 # ~/utils/sync-teams-transcripts.sh (cron) uses this to copy transcripts into ~/scribe and scribe.gxb.vc.
 ```
 

@@ -7,6 +7,18 @@ function mailboxPath(path: string): string {
   return `/users/${encodeURIComponent(user)}` + path.slice(3);
 }
 
+// Graph error with the status code and Retry-After (when throttled) attached,
+// so commands can turn 404/403/429 into friendly messages.
+export class GraphError extends Error {
+  status: number;
+  retryAfter: number | null;
+  constructor(status: number, message: string, retryAfter: number | null = null) {
+    super(message);
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
 // Tests replace the HTTP layer with this. Receives the resolved path (after --user mapping).
 export type Transport = (path: string, options: RequestInit) => Promise<any>;
 let testTransport: Transport | null = null;
@@ -32,10 +44,27 @@ export async function graphRequest(path: string, options: RequestInit = {}): Pro
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Graph API ${res.status}: ${err}`);
+    const retryAfter = res.headers.get("Retry-After");
+    throw new GraphError(res.status, `Graph API ${res.status}: ${err}`, retryAfter ? parseInt(retryAfter, 10) : null);
   }
 
   return res.json();
+}
+
+// Like graphRequest but returns the raw Response, for binary/streaming endpoints
+// (file downloads). Tests may return a Response object from the stub transport.
+export async function graphRawRequest(path: string, options: RequestInit = {}): Promise<Response> {
+  if (testTransport) return testTransport(mailboxPath(path), options);
+  const token = await getAccessToken();
+  const resolved = mailboxPath(path);
+  const url = resolved.startsWith("http") ? resolved : `${GRAPH_BASE}${resolved}`;
+  return fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...options.headers,
+    },
+  });
 }
 
 // The `webLink` Graph hands back is a legacy /owa/?ItemID= link that answers 401

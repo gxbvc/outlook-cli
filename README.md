@@ -76,6 +76,18 @@ CLI tool for interacting with Microsoft Outlook email via the Microsoft Graph AP
 
 Timezone defaults to `OUTLOOK_DEFAULT_TZ` (`America/Chicago` if unset). Override per-call with `--tz`. `--today` uses start/end-of-day in the chosen timezone and expands recurrences via `/me/calendarView`.
 
+### Files (OneDrive and SharePoint)
+- `outlook-cli files search QUERY [--drive me|ricky]` — Search files and folders in a drive
+- `outlook-cli files ls PATH [--drive me|ricky]` — List a folder; paths are relative to the drive root (e.g. `10_Products`)
+- `outlook-cli files info PATH [--drive me|ricky]` — Show one item's metadata (name, id, size, hash); never file contents
+- `outlook-cli files get PATH [--drive me|ricky] [--out DIR]` — Download a file. Default cache is `~/tmp/onedrive-cache` (dir mode 700, files mode 600); saves under `<cache>/<drive>/<path>`. Streams to disk (safe for large files) and prints the local path, size and sha256.
+
+Drives: `me` is your OneDrive (`/me/drive`). `ricky` is the SharePoint document library "Ricky Bureau - GXB"; its drive id is resolved once via a Graph site search and cached (id only) in `tokens/drive-ids.json`.
+
+Read only. There are no delete, move, or write commands, and nothing in OneDrive is ever modified.
+
+**Setup (needs consent):** `files` requires the delegated Graph scopes `Files.Read.All` and `Sites.Read.All` (read only). They must be added to the Azure app registration and to `SCOPES` in `src/config.ts`, then run `outlook-cli auth` once. Until then, `files` commands return `CONSENT_REQUIRED` (403).
+
 ## Tips
 
 - **Always use `--html` instead of `--text`** when sending, replying, or creating drafts. Plain text (`--text`) renders without line breaks in Outlook — newlines are ignored. Use `<p>` tags for paragraphs and `<br>` for line breaks. Example:

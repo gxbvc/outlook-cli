@@ -6,6 +6,7 @@ import { registerFolders } from "./commands/folders.js";
 import { registerMe } from "./commands/me.js";
 import { registerCalendar } from "./commands/calendar.js";
 import { registerMeetings } from "./commands/meetings.js";
+import { registerFiles } from "./commands/files.js";
 
 const program = new Command();
 
@@ -37,5 +38,6 @@ registerFolders(program);
 registerMe(program);
 registerCalendar(program);
 registerMeetings(program);
+registerFiles(program);
 
 program.parse();
