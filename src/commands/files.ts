@@ -28,7 +28,7 @@ function driveCacheFile(): string {
   return process.env.OUTLOOK_DRIVE_CACHE || join(TOKENS_DIR, "drive-ids.json");
 }
 
-function readDriveCache(): Record<string, string> {
+function readDriveCache(): Record<string, any> {
   try {
     return JSON.parse(readFileSync(driveCacheFile(), "utf8"));
   } catch {
@@ -36,7 +36,7 @@ function readDriveCache(): Record<string, string> {
   }
 }
 
-function writeDriveCache(cache: Record<string, string>): void {
+function writeDriveCache(cache: Record<string, any>): void {
   mkdirSync(dirname(driveCacheFile()), { recursive: true });
   writeFileSync(driveCacheFile(), JSON.stringify(cache, null, 2) + "\n", { mode: 0o600 });
 }
@@ -44,18 +44,21 @@ function writeDriveCache(cache: Record<string, string>): void {
 async function rickyDriveId(): Promise<string> {
   const cache = readDriveCache();
   const cached = cache[SHARED_LIBRARY_NAME];
-  if (cached) {
-    // Re-verify the cached id once per run: a stale id (for example one cached
-    // by the old first-hit fallback) must never be written through.
+  if (cached && typeof cached === "object" && cached.driveId && cached.siteId) {
+    // Re-verify once per run: does the site we recorded still own this drive?
+    // drive.name alone is useless — SharePoint calls its drives "Documents".
     try {
-      const drive = await graphRequest(`/drives/${cached}`);
-      if (drive?.name === SHARED_LIBRARY_NAME) return cached;
+      const drive = await graphRequest(`/sites/${cached.siteId}/drive`);
+      if (drive?.id === cached.driveId) return cached.driveId;
     } catch (e: any) {
       if (!(e instanceof GraphError)) throw e;
       // 404 or access error: treat as stale and re-resolve below.
     }
     delete cache[SHARED_LIBRARY_NAME];
     writeDriveCache(cache);
+  } else if (cached) {
+    // Legacy string id from an older release: no site id to verify against.
+    delete cache[SHARED_LIBRARY_NAME];
   }
   const sites = await graphRequest(`/sites?search=${encodeURIComponent(SHARED_LIBRARY_NAME)}`);
   // Exact library name only. A fuzzy or first-hit fallback would cache the
@@ -63,7 +66,7 @@ async function rickyDriveId(): Promise<string> {
   const site = sites?.value?.find((s: any) => s.displayName === SHARED_LIBRARY_NAME);
   if (!site) err(`SharePoint site "${SHARED_LIBRARY_NAME}" not found (exact match). Check Sites.Read.All consent.`, "SITE_NOT_FOUND");
   const drive = await graphRequest(`/sites/${site.id}/drive`);
-  cache[SHARED_LIBRARY_NAME] = drive.id;
+  cache[SHARED_LIBRARY_NAME] = { driveId: drive.id, siteId: site.id };
   writeDriveCache(cache);
   return drive.id;
 }
@@ -202,6 +205,23 @@ async function ensureFolder(base: string, segments: string[]): Promise<void> {
   }
 }
 
+// Stream the sha256 of a local file.
+function sha256Of(localPath: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
 // Stream the sha1 of a local file (fallback for personal OneDrive items).
 function sha1Of(localPath: string): string {
   const hash = createHash("sha1");
@@ -238,10 +258,11 @@ function sleep(ms: number): Promise<void> {
 
 // Upload one local file. Small: single PUT with conflictBehavior on the URL.
 // Large: an upload session, streamed one chunk at a time (never the whole file
-// in memory), chunks retried on 429/5xx/network errors with Retry-After (max
-// 3), the session cancelled on final failure. Hashes while sending; refuses
-// when the local file changes size during the upload; verifies the stored
-// quickXorHash against the local one when Graph reports it.
+// in memory). Chunks retry on 429/5xx/network errors (max 3, Retry-After
+// honored up to 60 s); after a network error or a 416 the session is re-GET
+// and the upload resumes from nextExpectedRanges; the session is cancelled on
+// final failure. Refuses when the local file changes size during the upload;
+// verifies the stored quickXorHash against the local one when Graph reports it.
 async function uploadFile(base: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
   const startSize = statSync(localPath).size;
   const hash = createHash("sha256");
@@ -270,7 +291,15 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
     );
     const item = await res.json();
     checkStoredHash(item);
-    return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "simple", eTag: item.eTag };
+    return {
+      id: item.id,
+      size: startSize,
+      sha256: hash.digest("hex"),
+      mode: "simple",
+      eTag: item.eTag,
+      qxh: item.file?.hashes?.quickXorHash,
+      cTag: item.cTag,
+    };
   }
 
   const sessionHeaders: Record<string, string> = {};
@@ -291,9 +320,23 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
     }
   };
 
+  // Ask the session where to continue: nextExpectedRanges after a network
+  // error or a 416; the drive item once everything is received.
+  const sessionStatus = async (): Promise<{ resume: number | null; item: any | null }> => {
+    const res = await graphRawRequest(uploadUrl, { method: "GET" });
+    if (!res.ok) return { resume: null, item: null };
+    const data = await res.json();
+    if (data?.id) return { resume: null, item: data };
+    const range = String(data?.nextExpectedRanges?.[0] || "").replace(/^bytes\s+/, "");
+    const from = parseInt(range.split("-")[0], 10);
+    return { resume: isNaN(from) ? null : from, item: null };
+  };
+
+  // sha256 is computed in one full pass up front: resumes can skip or repeat
+  // bytes, so hashing per chunk would corrupt the digest.
   let item: any = null;
-  let sent = 0;
-  for (let start = 0; start < startSize; start += UPLOAD_CHUNK_SIZE) {
+  let start = 0;
+  upload: while (start < startSize) {
     const end = Math.min(start + UPLOAD_CHUNK_SIZE, startSize) - 1;
     const len = end - start + 1;
     const buf = Buffer.alloc(len);
@@ -309,7 +352,6 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
       err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
     }
     const chunk = nRead === buf.length ? buf : buf.subarray(0, nRead);
-    hash.update(chunk);
 
     let attempt = 0;
     for (;;) {
@@ -324,17 +366,44 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
           body: chunk,
         });
       } catch (e: any) {
-        // A network error (fetch rejects) retries like a 5xx.
-        if (attempt < 3) {
-          attempt++;
-          await sleep(retryDelayMs(null, attempt));
-          continue;
+        // A network error (fetch rejects) retries like a 5xx: re-GET the
+        // session and resume from nextExpectedRanges (416-safe).
+        attempt++;
+        if (attempt > 3) {
+          await cancelSession();
+          throw new GraphError(0, `Network error on chunk ${start}-${start + chunk.length - 1} after 3 retries: ${e?.message || e}`);
+        }
+        await sleep(retryDelayMs(null, attempt));
+        const status = await sessionStatus();
+        if (status.item) {
+          item = status.item;
+          break upload;
+        }
+        if (status.resume != null && status.resume >= startSize) {
+          start = startSize;
+          break upload;
+        }
+        if (status.resume != null && status.resume !== start) {
+          start = status.resume;
+          continue upload;
+        }
+        continue; // nothing received yet: resend the same chunk
+      }
+      if (chunkRes.status === 416) {
+        // The session has different bytes than we sent: resync, never blind-retry.
+        const status = await sessionStatus();
+        if (status.item) {
+          item = status.item;
+          break upload;
+        }
+        if (status.resume != null && status.resume < startSize) {
+          start = status.resume;
+          continue upload;
         }
         await cancelSession();
-        throw new GraphError(0, `Network error on chunk ${start}-${start + chunk.length - 1} after ${attempt} retries: ${e?.message || e}`);
+        err(`Chunk upload out of sync (416) for "${rel}"`, "UPLOAD_OUT_OF_SYNC");
       }
       if (chunkRes.ok) {
-        sent += chunk.length;
         const text = await chunkRes.text();
         if (text) {
           try {
@@ -344,6 +413,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
             // 202 progress responses are JSON, but never fail the upload over parsing
           }
         }
+        start = start + chunk.length;
         break;
       }
       const retryAfter = chunkRes.headers.get("Retry-After");
@@ -358,17 +428,25 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
       throw new GraphError(
         chunkRes.status,
         `Graph API ${chunkRes.status} chunk ${start}-${start + chunk.length - 1} after ${attempt} retries: ${body}`,
-        retryAfter ? parseInt(retryAfter, 10) : null
+        retryAfter ? parseInt(retryAfter, 10) || 0 : null
       );
     }
   }
-  if (statSync(localPath).size !== startSize || sent !== startSize) {
+  if (statSync(localPath).size !== startSize) {
     await cancelSession();
     err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
   }
   if (!item) err("Upload finished but Graph returned no drive item", "UPLOAD_INCOMPLETE");
   checkStoredHash(item);
-  return { id: item.id, size: startSize, sha256: hash.digest("hex"), mode: "session", eTag: item.eTag };
+  return {
+    id: item.id,
+    size: startSize,
+    sha256: sha256Of(localPath),
+    mode: "session",
+    eTag: item.eTag,
+    qxh: item.file?.hashes?.quickXorHash,
+    cTag: item.cTag,
+  };
 }
 
 // OneDrive for Business and SharePoint return only quickXorHash in
@@ -407,9 +485,11 @@ export function detectCaseCollisions(rels: string[]): Set<string> {
   return collisions;
 }
 
-// Per-target sync state: the eTag each remote file had at its last successful
-// sync. A remote whose eTag differs from the stored one changed since then —
-// even when it looks older — so both-sides-edited becomes a conflict.
+// Per-target sync state: the content markers (quickXorHash and cTag when
+// present) each remote file had at its last successful sync. A remote whose
+// content differs from this changed since then — even when it looks older —
+// so both-sides-edited becomes a conflict. The eTag is deliberately not used:
+// SharePoint bumps it on metadata-only changes.
 function syncStateDir(): string {
   return process.env.OUTLOOK_SYNC_STATE_DIR || join(homedir(), ".config", "outlook-cli", "sync-state");
 }
@@ -419,7 +499,9 @@ function syncStateFile(drive: string, target: string): string {
   return join(syncStateDir(), `${drive}-${h}.json`);
 }
 
-function readSyncState(file: string): Record<string, { eTag?: string; syncedAt?: string }> {
+type SyncStateEntry = { qxh?: string; cTag?: string; syncedAt?: string };
+
+function readSyncState(file: string): Record<string, SyncStateEntry> {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
   } catch {
@@ -427,7 +509,7 @@ function readSyncState(file: string): Record<string, { eTag?: string; syncedAt?:
   }
 }
 
-function writeSyncState(file: string, state: Record<string, { eTag?: string; syncedAt?: string }>): void {
+function writeSyncState(file: string, state: Record<string, SyncStateEntry>): void {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
@@ -703,9 +785,9 @@ export function registerFiles(program: Command) {
           const same = remote && remote.size === st.size && hashMatches;
           if (same) {
             unchanged++;
-            // Identical content: record the remote's current eTag as the
-            // last-synced one (apply only; dry-run never writes state).
-            if (opts.apply && remote.eTag) state[remoteRel] = { eTag: remote.eTag, syncedAt: new Date().toISOString() };
+            // Identical content: record the remote's content markers as the
+            // last-synced ones (apply only; dry-run never writes state).
+            if (opts.apply) state[remoteRel] = { qxh: hashes.quickXorHash || undefined, cTag: remote.cTag, syncedAt: new Date().toISOString() };
             continue;
           }
           const times = {
@@ -716,16 +798,23 @@ export function registerFiles(program: Command) {
             plan.push({ file: rel, remote: remoteRel, size: st.size, changed: false, ...times });
             continue;
           }
-          // Both-sides-edited guard: a remote whose eTag differs from the one
-          // recorded at the last sync changed since then, even when it looks
-          // older. First sync with no stored state falls back to the mtime rule.
+          // Both-sides-edited guard, content-based: a remote whose quickXorHash
+          // differs from the one recorded at the last sync has different bytes
+          // than what we uploaded, even when it looks older. cTag is the
+          // fallback (SharePoint bumps eTag on metadata-only changes, so the
+          // eTag itself is never the signal). First sync with no stored state
+          // falls back to the mtime rule.
+          const remoteQxh = hashes.quickXorHash || null;
           const stored = state[remoteRel];
-          if (stored?.eTag && remote.eTag && stored.eTag !== remote.eTag) {
+          const contentChangedSinceSync =
+            (stored?.qxh && remoteQxh && stored.qxh !== remoteQxh) ||
+            (!remoteQxh && !!stored?.cTag && !!remote?.cTag && stored.cTag !== remote.cTag);
+          if (contentChangedSinceSync) {
             plan.push({
               file: rel,
               remote: remoteRel,
               size: st.size,
-              conflict: "remote changed since the last sync (eTag differs from the stored one)",
+              conflict: "remote content changed since the last sync; both sides may be edited",
               ...times,
             });
             continue;
@@ -769,7 +858,7 @@ export function registerFiles(program: Command) {
               u.id = r.id;
               u.sha256 = r.sha256;
               u.uploadedVia = r.mode;
-              if (r.eTag) state[u.remote] = { eTag: r.eTag, syncedAt: new Date().toISOString() };
+              if (r.qxh || r.cTag) state[u.remote] = { qxh: r.qxh, cTag: r.cTag, syncedAt: new Date().toISOString() };
             } catch (e: any) {
               if (e instanceof GraphError && e.status === 412) {
                 u.conflict = "remote changed during upload (412); skipped";

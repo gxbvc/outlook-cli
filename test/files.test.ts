@@ -12,6 +12,7 @@ process.env.OUTLOOK_TENANT_ID ||= "test";
 
 const { setTransportForTests, GraphError } = await import("../src/graph.js");
 const { registerFiles } = await import("../src/commands/files.js");
+const { QuickXorHash } = await import("../src/quickxor.js");
 
 type Call = { path: string; method: string; body?: any; contentRange?: string; bodyLen?: number };
 let calls: Call[] = [];
@@ -81,9 +82,20 @@ beforeEach(() => {
       return { uploadUrl: "https://upload.example/session1", nextExpectedRanges: [] };
     if (q.endsWith(":/content") && method === "PUT") {
       if (putStatus[q]) return new Response(JSON.stringify({ error: "forced" }), { status: putStatus[q] });
-      return new Response(JSON.stringify({ name: "file", id: "UPLOADED-SIMPLE", size: record.bodyLen, eTag: '"ETAG-UPLOADED-1"' }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      // Graph echoes the stored file's quickXorHash; compute it from the bytes received.
+      const q2 = new QuickXorHash();
+      if (body) q2.update(body as any);
+      return new Response(
+        JSON.stringify({
+          name: "file",
+          id: "UPLOADED-SIMPLE",
+          size: record.bodyLen,
+          eTag: '"ETAG-UPLOADED-1"',
+          cTag: "CTAG-UPLOADED-1",
+          file: { hashes: { quickXorHash: q2.digestBase64() } },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
     if (q.endsWith("/children") && method === "POST")
       return { name: record.body?.name, id: `FOLDER-CREATED-${record.body?.name}`, folder: {} };
@@ -205,7 +217,7 @@ test("get on a --drive ricky file resolves the shared library drive id once and 
     await run("get", "docs/report.pdf", "--drive", "ricky", "--out", dir);
     await run("ls", "docs", "--drive", "ricky");
     const siteCalls = calls.filter((c) => c.path.startsWith("/sites")).length;
-    assert.equal(siteCalls, 2, "site search + site drive lookup happen only on first resolve");
+    assert.equal(siteCalls, 3, "search + site drive on resolve, plus one re-verification of the cached id");
     assert.deepEqual(
       calls.filter((c) => c.path.startsWith("/drives/") && c.path.split("?")[0] !== "/drives/DRIVE1").map((c) => c.path.split("?")[0]),
       [
@@ -214,31 +226,41 @@ test("get on a --drive ricky file resolves the shared library drive id once and 
         "/drives/DRIVE1/root:/docs:/children",
       ]
     );
-    assert.equal(calls.filter((c) => c.path.split("?")[0] === "/drives/DRIVE1").length, 1, "verified once per run (only the cached run)");
     assert.equal(readFileSync(join(dir, "ricky", "docs", "report.pdf"), "utf8"), "ricky-file-body-contents");
     // The cache file holds only the drive id.
     const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
-    assert.deepEqual(cached, { "Ricky Bureau - GXB": "DRIVE1" });
+    assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("ricky drive id is reused from cache (verified once) without a site search", async () => {
-  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "CACHED1" }));
+  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } }));
   await run("info", "docs/report.pdf", "--drive", "ricky");
-  assert.equal(calls.filter((c) => c.path.startsWith("/sites")).length, 0);
-  assert.equal(calls[0].path, "/drives/CACHED1", "the cached id is re-verified once per run");
-  assert.equal(calls[1].path, "/drives/CACHED1/root:/docs/report.pdf");
+  assert.equal(calls.filter((c) => c.path.includes("/sites?search=")).length, 0, "no site search needed");
+  assert.equal(calls[0].path, "/sites/SITE1/drive", "the cached id is re-verified once per run via the site's drive");
+  assert.equal(calls[1].path, "/drives/DRIVE1/root:/docs/report.pdf");
 });
 
-test("ricky: a cached id whose drive no longer matches is dropped and re-resolved", async () => {
-  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "STALE1" }));
+test("ricky: a cached drive id the site no longer owns is dropped and re-resolved", async () => {
+  writeFileSync(
+    process.env.OUTLOOK_DRIVE_CACHE,
+    JSON.stringify({ "Ricky Bureau - GXB": { driveId: "STALE1", siteId: "SITE1" } })
+  );
   const o = await run("ls", "docs", "--drive", "ricky");
   assert.equal(o.ok, true);
-  assert.equal(calls.some((c) => c.path.startsWith("/sites")), true, "re-resolves after dropping the stale id");
+  assert.equal(calls.some((c) => c.path.includes("/sites?search=")), true, "re-resolves after dropping the stale id");
   const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
-  assert.deepEqual(cached, { "Ricky Bureau - GXB": "DRIVE1" });
+  assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
+});
+
+test("ricky: a legacy string cache entry (older release) is migrated", async () => {
+  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "LEGACY1" }));
+  const o = await run("ls", "docs", "--drive", "ricky");
+  assert.equal(o.ok, true);
+  const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
+  assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
 });
 
 test("404 becomes a friendly NOT_FOUND error", async () => {
@@ -900,7 +922,7 @@ test("SHOULD: one bad local file name is skipped and reported, the rest sync", a
   }
 });
 
-test("SHOULD: the sync state file stores eTags; a remote changed since the last sync is a conflict", async () => {
+test("SHOULD: the sync state file stores content markers; a remote content change since the last sync is a conflict", async () => {
   const dir = mkdtempSync(join(tmpdir(), "odstate-"));
   const stateDir = join(dir, "state");
   process.env.OUTLOOK_SYNC_STATE_DIR = stateDir;
@@ -909,10 +931,9 @@ test("SHOULD: the sync state file stores eTags; a remote changed since the last 
     mkdirSync(src);
     writeFileSync(join(src, "doc.txt"), "local edit");
     remoteItems = {
-      // remote looks OLD (mtime rule would replace) and has a matching-content hash? no:
-      // content differs (changed), remote mtime old, eTag known
+      // remote looks OLD (mtime rule would replace) and its content differs
       "syncdst/doc.txt": {
-        name: "doc.txt", id: "D1", size: 99, eTag: "\"ETAG-D1\"",
+        name: "doc.txt", id: "D1", size: 99, eTag: "\"ETAG-D1\"", cTag: "\"CTAG-D1\"",
         lastModifiedDateTime: "2000-01-01T00:00:00Z", file: { hashes: { quickXorHash: "WRONG=" } },
       },
     };
@@ -920,23 +941,37 @@ test("SHOULD: the sync state file stores eTags; a remote changed since the last 
     const o1 = await run("sync", src, "syncdst", "--apply");
     assert.equal(o1.data.conflicts, 0);
     const stateFile = readdirSync(stateDir)[0];
-    assert.match(stateFile, /^me-/.test(stateFile) ? /^me-/ : /./); // drive-prefixed name
     const state = JSON.parse(readFileSync(join(stateDir, stateFile), "utf8"));
-    assert.equal(state["syncdst/doc.txt"].eTag, "\"ETAG-UPLOADED-1\"");
+    const qxhOf = (s2: string) => { const q = new QuickXorHash(); q.update(Buffer.from(s2)); return q.digestBase64(); };
+    assert.equal(state["syncdst/doc.txt"].qxh, qxhOf("local edit"), "the stored marker is the uploaded content's hash");
     assert.equal(statSync(join(stateDir, stateFile)).mode & 0o777, 0o600);
 
-    // Second apply: remote STILL has the old mtime but a DIFFERENT eTag than
-    // the stored one -> both sides edited -> CONFLICT, never replaced.
+    // Second apply: remote STILL looks old, but its quickXorHash differs from
+    // the stored one -> the content changed since our sync -> CONFLICT.
     remoteItems["syncdst/doc.txt"] = {
       ...remoteItems["syncdst/doc.txt"],
-      eTag: "\"ETAG-D2\"", // Ricky edited it after our sync
+      cTag: "\"CTAG-D2\"",
+      file: { hashes: { quickXorHash: "WRONG2=" } },
     };
     const putsBefore = calls.filter((c) => c.method === "PUT").length;
     const o2 = await run("sync", src, "syncdst", "--apply");
     const entry = o2.data.files.find((f: any) => f.file === "doc.txt");
-    assert.match(entry.conflict, /changed since the last sync/);
+    assert.match(entry.conflict, /content changed since the last sync/);
     assert.equal(o2.data.conflicts, 1);
     assert.equal(calls.filter((c) => c.method === "PUT").length, putsBefore, "the conflicted file is never uploaded");
+
+    // A metadata-only remote change (same quickXorHash, bumped cTag/eTag, old
+    // mtime) is NOT a conflict: content is what sync compares.
+    remoteItems["syncdst/doc.txt"] = {
+      ...remoteItems["syncdst/doc.txt"],
+      eTag: "\"ETAG-D3\"",
+      cTag: "\"CTAG-D3\"",
+      size: Buffer.byteLength("local edit"),
+      file: { hashes: { quickXorHash: qxhOf("local edit") } },
+    };
+    const o3 = await run("sync", src, "syncdst", "--apply");
+    assert.equal(o3.data.conflicts, 0);
+    assert.equal(o3.data.unchanged, 1, "same content = unchanged, no re-upload, no conflict");
 
     // dry-run never writes state
     rmSync(stateDir, { recursive: true, force: true });
@@ -948,30 +983,80 @@ test("SHOULD: the sync state file stores eTags; a remote changed since the last 
   }
 });
 
-test("SHOULD: a network error on a chunk is retried, then the session cancelled", async () => {
+test("SHOULD: a network error on a chunk re-GETs the session and resumes from nextExpectedRanges", async () => {
   const dir = mkdtempSync(join(tmpdir(), "odnet-"));
   try {
     const local = join(dir, "big.bin");
     writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
-    let chunkAttempts = 0;
+    const total = 5 * 1024 * 1024 + 512 * 1024;
+    let chunkPuts = 0;
+    let sessionGets = 0;
+    let received = 0; // bytes the stub session has accepted
     setTransportForTests(async (path, options) => {
       const method = String(options.method || "GET");
-      calls.push({ path, method });
+      calls.push({ path, method, contentRange: (options.headers as any)?.["Content-Range"] });
       const q = path.split("?")[0];
       if (q.startsWith("https://upload.example/")) {
         if (method === "DELETE") return new Response(null, { status: 204 });
-        chunkAttempts++;
-        if (chunkAttempts <= 2) throw new TypeError("fetch failed"); // network errors
-        if (chunkAttempts < 4) return new Response(JSON.stringify({ nextExpectedRanges: ["1-"] }), { status: 202 });
-        return new Response(JSON.stringify({ name: "big.bin", id: "UP1", size: 5 * 1024 * 1024 + 512 * 1024 }));
+        if (method === "GET") {
+          sessionGets++;
+          if (received >= total) return new Response(JSON.stringify({ name: "big.bin", id: "UP1", size: total }));
+          return new Response(JSON.stringify({ nextExpectedRanges: [`bytes ${received}-`] }));
+        }
+        chunkPuts++;
+        if (chunkPuts === 1 || chunkPuts === 3) throw new TypeError("fetch failed"); // network error on each chunk
+        const range = (options.headers as any)["Content-Range"]; // "bytes start-end/total"
+        received = parseInt(range.split(" ")[1].split("-")[1], 10) + 1;
+        if (received >= total)
+          return new Response(JSON.stringify({ name: "big.bin", id: "UP1", size: total }));
+        return new Response(JSON.stringify({ nextExpectedRanges: [`bytes ${received}-`] }), { status: 202 });
       }
       if (q === "/me/drive/root:/uploads") return { id: "F1", folder: {} };
       if (q.endsWith(":/createUploadSession") && method === "POST") return { uploadUrl: "https://upload.example/session1" };
       throw new GraphError(404, "Graph API 404: unexpected " + q);
     });
     const o = await run("put", local, "uploads/big.bin");
-    assert.equal(o.ok, true);
-    assert.equal(chunkAttempts, 4);
+    assert.equal(o.ok, true, o.error || "");
+    assert.equal(chunkPuts, 4, "each chunk sent twice: once into the network error, once again");
+    assert.equal(sessionGets, 2, "one session GET per network error");
+    // The resumed uploads covered the whole file at the right offsets.
+    assert.equal(
+      calls.some((c) => c.method === "PUT" && c.contentRange === `bytes 5242880-${total - 1}/${total}`),
+      true,
+      "the second chunk resumed from nextExpectedRanges"
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SHOULD: a 416 resyncs from nextExpectedRanges instead of blind-retrying", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "od416-"));
+  try {
+    const local = join(dir, "big.bin");
+    writeFileSync(local, Buffer.alloc(5 * 1024 * 1024 + 512 * 1024, 7));
+    const total = 5 * 1024 * 1024 + 512 * 1024;
+    let received = 0;
+    setTransportForTests(async (path, options) => {
+      const method = String(options.method || "GET");
+      calls.push({ path, method });
+      const q = path.split("?")[0];
+      if (q.startsWith("https://upload.example/")) {
+        if (method === "DELETE") return new Response(null, { status: 204 });
+        if (method === "GET") return new Response(JSON.stringify({ nextExpectedRanges: [`bytes ${received}-`] }));
+        const range = (options.headers as any)["Content-Range"];
+        const from = parseInt(range.split(" ")[1].split("-")[0], 10);
+        if (from < received) return new Response(JSON.stringify({ e: "range overlap" }), { status: 416 });
+        received = parseInt(range.split(" ")[1].split("-")[1], 10) + 1;
+        if (received >= total) return new Response(JSON.stringify({ name: "big.bin", id: "UP1", size: total }));
+        return new Response(JSON.stringify({ nextExpectedRanges: [`bytes ${received}-`] }), { status: 202 });
+      }
+      if (q === "/me/drive/root:/uploads") return { id: "F1", folder: {} };
+      if (q.endsWith(":/createUploadSession") && method === "POST") return { uploadUrl: "https://upload.example/session1" };
+      throw new GraphError(404, "Graph API 404: unexpected " + q);
+    });
+    const o = await run("put", local, "uploads/big.bin");
+    assert.equal(o.ok, true, o.error || "");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
