@@ -40,6 +40,14 @@ function searchItem() {
   return { ...driveItem, parentReference: { path: "/drives/DRIVE1/root:/10_Products" } };
 }
 
+const rickyFolderItem = { name: "GXB", id: "GXB1", folder: { childCount: 1 }, parentReference: { driveId: "DRIVE1", path: "/drives/DRIVE1/root:" } };
+const rickyItem = {
+  ...driveItem,
+  size: 24,
+  file: { hashes: { quickXorHash: "002gYFWLb0aeFt0NPkMLxPAGMuQ=" } },
+  parentReference: { driveId: "DRIVE1", path: "/drives/DRIVE1/root:/GXB/docs" },
+};
+
 beforeEach(() => {
   calls = [];
   lines = [];
@@ -99,22 +107,21 @@ beforeEach(() => {
     }
     if (q.endsWith("/children") && method === "POST")
       return { name: record.body?.name, id: `FOLDER-CREATED-${record.body?.name}`, folder: {} };
-    if (q === "/sites/SITE1/drive") return { id: "DRIVE1", name: "Ricky Bureau - GXB" };
-    if (q === "/drives/DRIVE1" || q === "/drives/CACHED1") return { id: q.split("/")[2], name: "Ricky Bureau - GXB" };
+    // Ricky's shared library: the GXB folder in his own OneDrive.
+    if (q === "/users/ricky%40gxb.vc/drive/root:/GXB") return rickyFolderItem;
+    if (q === "/drives/DRIVE1/items/GXB1") return rickyFolderItem;
     if (q === "/me/drive/root") return { name: "root", id: "ROOT1", folder: {} };
-    if (q.startsWith("/sites")) return { value: [{ id: "SITE1", displayName: "Ricky Bureau - GXB" }] };
     if (q.includes("/search(q=")) return { value: [searchItem()] };
     if (q === "/me/drive/root/children") return { value: [driveItem] };
     if (q === "/me/drive/root:/10_Products/My%20Folder:/children") return { value: [childItem] };
-    if (q === "/drives/DRIVE1/root:/docs:/children") return { value: [searchItem()] };
-    if (q === "/drives/DRIVE1/root:/docs/report.pdf")
-      return { ...driveItem, size: 24, file: { hashes: { quickXorHash: "002gYFWLb0aeFt0NPkMLxPAGMuQ=" } }, parentReference: { path: "/drives/DRIVE1/root:/docs" } };
+    if (q === "/drives/DRIVE1/items/GXB1:/docs:/children") return { value: [rickyItem] };
+    if (q === "/drives/DRIVE1/items/GXB1:/docs/report.pdf") return rickyItem;
     if (q === "/me/drive/root:/10_Products/report.pdf") return driveItem;
     if (q === "/me/drive/root:/docs" || q === "/me/drive/root:/somedir" || q === "/me/drive/root:/syncdst" || q === "/me/drive/root:/uploads")
       return { name: q.split("/").pop(), id: "FOLDER1", folder: {} };
     if (q === "/me/drive/root:/docs/report.pdf") return driveItem;
     if (q === "/me/drive/root:/10_Products/report.pdf:/content") return new Response("file-body-contents");
-    if (q === "/drives/DRIVE1/root:/docs/report.pdf:/content") return new Response("ricky-file-body-contents");
+    if (q === "/drives/DRIVE1/items/GXB1:/docs/report.pdf:/content") return new Response("ricky-file-body-contents");
     if (q.startsWith("/me/drive/root:/")) {
       const rel = q.slice("/me/drive/root:/".length);
       if (rel in remoteItems) return remoteItems[rel];
@@ -211,56 +218,54 @@ test("get streams to a temp cache dir with mode 600 and correct sha256", async (
   }
 });
 
-test("get on a --drive ricky file resolves the shared library drive id once and caches it", async () => {
+test("get on a --drive ricky file resolves the GXB folder in Ricky's OneDrive once and caches it", async () => {
   const dir = mkdtempSync(join(tmpdir(), "odricky-"));
   try {
     await run("get", "docs/report.pdf", "--drive", "ricky", "--out", dir);
-    await run("ls", "docs", "--drive", "ricky");
-    const siteCalls = calls.filter((c) => c.path.startsWith("/sites")).length;
-    assert.equal(siteCalls, 3, "search + site drive on resolve, plus one re-verification of the cached id");
+    const o = await run("ls", "docs", "--drive", "ricky");
+    assert.equal(calls.some((c) => c.path.startsWith("/sites")), false, "no site search: it is not a SharePoint site");
     assert.deepEqual(
-      calls.filter((c) => c.path.startsWith("/drives/") && c.path.split("?")[0] !== "/drives/DRIVE1").map((c) => c.path.split("?")[0]),
+      calls.map((c) => c.path.split("?")[0]),
       [
-        "/drives/DRIVE1/root:/docs/report.pdf",
-        "/drives/DRIVE1/root:/docs/report.pdf:/content",
-        "/drives/DRIVE1/root:/docs:/children",
+        "/users/ricky%40gxb.vc/drive/root:/GXB",
+        "/drives/DRIVE1/items/GXB1:/docs/report.pdf",
+        "/drives/DRIVE1/items/GXB1:/docs/report.pdf:/content",
+        "/drives/DRIVE1/items/GXB1",
+        "/drives/DRIVE1/items/GXB1:/docs:/children",
       ]
     );
     assert.equal(readFileSync(join(dir, "ricky", "docs", "report.pdf"), "utf8"), "ricky-file-body-contents");
-    // The cache file holds only the drive id.
+    assert.equal(o.data.items[0].path, "docs/report.pdf", "paths are relative to the GXB folder");
+    // The cache file holds only the ids.
     const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
-    assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
+    assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", itemId: "GXB1" } });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("ricky drive id is reused from cache (verified once) without a site search", async () => {
-  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } }));
-  await run("info", "docs/report.pdf", "--drive", "ricky");
-  assert.equal(calls.filter((c) => c.path.includes("/sites?search=")).length, 0, "no site search needed");
-  assert.equal(calls[0].path, "/sites/SITE1/drive", "the cached id is re-verified once per run via the site's drive");
-  assert.equal(calls[1].path, "/drives/DRIVE1/root:/docs/report.pdf");
+test("ricky: ls at the root lists the GXB folder's children", async () => {
+  await run("ls", "/", "--drive", "ricky");
+  assert.equal(calls[calls.length - 1].path.split("?")[0], "/drives/DRIVE1/items/GXB1/children");
 });
 
-test("ricky: a cached drive id the site no longer owns is dropped and re-resolved", async () => {
-  writeFileSync(
-    process.env.OUTLOOK_DRIVE_CACHE,
-    JSON.stringify({ "Ricky Bureau - GXB": { driveId: "STALE1", siteId: "SITE1" } })
-  );
+test("ricky: a cached folder that is no longer GXB is dropped and re-resolved", async () => {
+  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": { driveId: "DRIVE1", itemId: "STALE1" } }));
   const o = await run("ls", "docs", "--drive", "ricky");
   assert.equal(o.ok, true);
-  assert.equal(calls.some((c) => c.path.includes("/sites?search=")), true, "re-resolves after dropping the stale id");
+  assert.equal(calls.some((c) => c.path === "/users/ricky%40gxb.vc/drive/root:/GXB"), true, "re-resolves after dropping the stale id");
   const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
-  assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
+  assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", itemId: "GXB1" } });
 });
 
-test("ricky: a legacy string cache entry (older release) is migrated", async () => {
-  writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": "LEGACY1" }));
-  const o = await run("ls", "docs", "--drive", "ricky");
-  assert.equal(o.ok, true);
-  const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
-  assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", siteId: "SITE1" } });
+test("ricky: old site-based cache entries (string or siteId) are migrated", async () => {
+  for (const old of ["LEGACY1", { driveId: "DRIVE9", siteId: "SITE1" }]) {
+    writeFileSync(process.env.OUTLOOK_DRIVE_CACHE, JSON.stringify({ "Ricky Bureau - GXB": old }));
+    const o = await run("ls", "docs", "--drive", "ricky");
+    assert.equal(o.ok, true);
+    const cached = JSON.parse(readFileSync(process.env.OUTLOOK_DRIVE_CACHE, "utf8"));
+    assert.deepEqual(cached, { "Ricky Bureau - GXB": { driveId: "DRIVE1", itemId: "GXB1" } });
+  }
 });
 
 test("404 becomes a friendly NOT_FOUND error", async () => {
@@ -632,14 +637,20 @@ test("M3: sync --apply replaces only files whose remote copy is older; If-Match 
   }
 });
 
-test("M4: --drive ricky needs an exact library name and caches nothing on miss", async () => {
+test("M4: --drive ricky needs the exact GXB folder and caches nothing on miss", async () => {
   setTransportForTests(async (path) => {
     const q = path.split("?")[0];
-    if (q.startsWith("/sites")) return { value: [{ id: "SITE9", displayName: "Wrong Library" }] };
-    throw new GraphError(404, "Graph API 404: should never get past site search");
+    calls.push({ path, method: "GET" });
+    if (q === "/users/ricky%40gxb.vc/drive/root:/GXB") return { name: "GXB", id: "F9", file: {}, parentReference: { driveId: "DRIVE9" } };
+    throw new GraphError(404, "Graph API 404: should never get past the folder lookup");
   });
   const o = await run("info", "docs/report.pdf", "--drive", "ricky");
-  assert.equal(o.code, "SITE_NOT_FOUND");
+  assert.equal(o.code, "LIBRARY_NOT_FOUND", "a file named GXB is not the folder");
+  setTransportForTests(async () => {
+    throw new GraphError(404, "Graph API 404: item not found");
+  });
+  const o2 = await run("info", "docs/report.pdf", "--drive", "ricky");
+  assert.equal(o2.code, "LIBRARY_NOT_FOUND");
   assert.equal(calls.some((c) => c.path.startsWith("/drives/")), false, "no drive may be picked as a fallback");
   assert.equal(existsSync(process.env.OUTLOOK_DRIVE_CACHE), false, "nothing cached on a miss");
 });

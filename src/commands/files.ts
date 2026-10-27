@@ -16,14 +16,18 @@ import { QuickXorHash } from "../quickxor.js";
 
 const DEFAULT_CACHE = join(homedir(), "tmp", "onedrive-cache");
 const SHARED_LIBRARY_NAME = "Ricky Bureau - GXB";
+// "Ricky Bureau - GXB" is the GXB folder in Ricky's own OneDrive, shared
+// with us. It is not a SharePoint site, so a site search never finds it.
+const RICKY_UPN = "ricky@gxb.vc";
+const RICKY_FOLDER = "GXB";
 
 // Files over 4 MiB upload through a Graph upload session in chunks; the chunk
 // size must be a multiple of 320 KiB, so 5 MiB it is.
 const UPLOAD_SESSION_THRESHOLD = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
 
-// --drive ricky resolves the shared library's drive id once through a site
-// search and caches only the id here (never tokens or file data).
+// --drive ricky resolves the shared folder's drive id and item id once and
+// caches only the ids here (never tokens or file data).
 function driveCacheFile(): string {
   return process.env.OUTLOOK_DRIVE_CACHE || join(TOKENS_DIR, "drive-ids.json");
 }
@@ -41,15 +45,14 @@ function writeDriveCache(cache: Record<string, any>): void {
   writeFileSync(driveCacheFile(), JSON.stringify(cache, null, 2) + "\n", { mode: 0o600 });
 }
 
-async function rickyDriveId(): Promise<string> {
+async function rickyFolder(): Promise<{ driveId: string; itemId: string }> {
   const cache = readDriveCache();
   const cached = cache[SHARED_LIBRARY_NAME];
-  if (cached && typeof cached === "object" && cached.driveId && cached.siteId) {
-    // Re-verify once per run: does the site we recorded still own this drive?
-    // drive.name alone is useless — SharePoint calls its drives "Documents".
+  if (cached && typeof cached === "object" && cached.driveId && cached.itemId) {
+    // Re-verify once per run: is the cached item still the GXB folder?
     try {
-      const drive = await graphRequest(`/sites/${cached.siteId}/drive`);
-      if (drive?.id === cached.driveId) return cached.driveId;
+      const item = await graphRequest(`/drives/${cached.driveId}/items/${cached.itemId}`);
+      if (item?.id === cached.itemId && item.folder && item.name === RICKY_FOLDER) return cached;
     } catch (e: any) {
       if (!(e instanceof GraphError)) throw e;
       // 404 or access error: treat as stale and re-resolve below.
@@ -57,25 +60,39 @@ async function rickyDriveId(): Promise<string> {
     delete cache[SHARED_LIBRARY_NAME];
     writeDriveCache(cache);
   } else if (cached) {
-    // Legacy string id from an older release: no site id to verify against.
+    // Older releases cached a site drive id (string or { driveId, siteId }).
     delete cache[SHARED_LIBRARY_NAME];
   }
-  const sites = await graphRequest(`/sites?search=${encodeURIComponent(SHARED_LIBRARY_NAME)}`);
-  // Exact library name only. A fuzzy or first-hit fallback would cache the
-  // wrong drive id and later puts/syncs would write into an unrelated library.
-  const site = sites?.value?.find((s: any) => s.displayName === SHARED_LIBRARY_NAME);
-  if (!site) err(`SharePoint site "${SHARED_LIBRARY_NAME}" not found (exact match). Check Sites.Read.All consent.`, "SITE_NOT_FOUND");
-  const drive = await graphRequest(`/sites/${site.id}/drive`);
-  cache[SHARED_LIBRARY_NAME] = { driveId: drive.id, siteId: site.id };
+  // Exact folder only. A fuzzy fallback would cache the wrong folder and
+  // later puts/syncs would write somewhere unrelated.
+  let item: any = null;
+  try {
+    item = await graphRequest(`/users/${encodeURIComponent(RICKY_UPN)}/drive/root:/${RICKY_FOLDER}`);
+  } catch (e: any) {
+    if (!isNotFound(e)) throw e;
+  }
+  if (!item?.folder || item.name !== RICKY_FOLDER || !item.parentReference?.driveId)
+    err(`Folder "${RICKY_FOLDER}" not found in ${RICKY_UPN}'s OneDrive (${SHARED_LIBRARY_NAME}).`, "LIBRARY_NOT_FOUND");
+  const ids = { driveId: item.parentReference.driveId, itemId: item.id };
+  cache[SHARED_LIBRARY_NAME] = ids;
   writeDriveCache(cache);
-  return drive.id;
+  return ids;
 }
 
-async function driveBase(drive: string): Promise<string> {
+// root: the Graph item every path is relative to ("/me/drive/root" or the
+// shared folder's item). Paths are "${root}:/a/b". searchBase scopes search.
+// prefix: the root folder's own path in its drive, stripped from item paths.
+type DriveRoot = { root: string; searchBase: string; prefix: string };
+
+async function resolveDrive(drive: string): Promise<DriveRoot> {
   // The global --user remaps /me to another mailbox; files commands do not support it.
   if (process.env.OUTLOOK_USER) err("files does not support --user", "USER_UNSUPPORTED");
-  if (drive === "me") return "/me/drive";
-  if (drive === "ricky") return `/drives/${await rickyDriveId()}`;
+  if (drive === "me") return { root: "/me/drive/root", searchBase: "/me/drive", prefix: "" };
+  if (drive === "ricky") {
+    const { driveId, itemId } = await rickyFolder();
+    const root = `/drives/${driveId}/items/${itemId}`;
+    return { root, searchBase: root, prefix: RICKY_FOLDER };
+  }
   err(`Unknown drive "${drive}" (use me or ricky)`, "BAD_DRIVE");
 }
 
@@ -108,26 +125,28 @@ function encPath(rel: string): string {
 }
 
 // Graph item path relative to the drive root ("root:/segment/segment").
-function itemPath(base: string, rel: string): string {
+function itemPath(root: string, rel: string): string {
   const enc = encPath(rel);
-  return enc ? `${base}/root:/${enc}` : `${base}/root`;
+  return enc ? `${root}:/${enc}` : root;
 }
 
-function relPathOf(item: any): string {
+function relPathOf(item: any, prefix = ""): string {
   const parent = item.parentReference?.path || "";
   const idx = parent.indexOf("root:");
-  const base = idx >= 0 ? parent.slice(idx + 5).replace(/^\//, "") : "";
+  let base = idx >= 0 ? parent.slice(idx + 5).replace(/^\//, "") : "";
+  if (prefix && base === prefix) base = "";
+  else if (prefix && base.startsWith(prefix + "/")) base = base.slice(prefix.length + 1);
   return base ? `${base}/${item.name}` : item.name;
 }
 
 // Show names, ids, sizes and hashes only. Never file contents.
-function slim(item: any) {
+function slim(item: any, prefix = "") {
   return {
     name: item.name,
     id: item.id,
     type: item.folder ? "folder" : "file",
     size: item.size,
-    path: relPathOf(item),
+    path: relPathOf(item, prefix),
     lastModified: item.lastModifiedDateTime,
     hash: item.file?.hashes?.quickXorHash || item.file?.hashes?.sha1Hash || null,
     webUrl: item.webUrl,
@@ -187,11 +206,11 @@ function isNotFound(e: any): boolean {
 
 // Create missing folders one segment at a time (conflictBehavior fail: never
 // replaces an existing folder). Only called when the user asked for it.
-async function ensureFolder(base: string, segments: string[]): Promise<void> {
+async function ensureFolder(root: string, segments: string[]): Promise<void> {
   let cur = "";
   for (const seg of segments) {
-    const item = cur ? `${base}/root:/${cur}/${encodeURIComponent(seg)}` : `${base}/root:/${encodeURIComponent(seg)}`;
-    const parent = cur ? `${base}/root:/${cur}` : `${base}/root`;
+    const item = cur ? `${root}:/${cur}/${encodeURIComponent(seg)}` : `${root}:/${encodeURIComponent(seg)}`;
+    const parent = cur ? `${root}:/${cur}` : root;
     try {
       await graphRequest(item);
     } catch (e: any) {
@@ -263,7 +282,7 @@ function sleep(ms: number): Promise<void> {
 // and the upload resumes from nextExpectedRanges; the session is cancelled on
 // final failure. Refuses when the local file changes size during the upload;
 // verifies the stored quickXorHash against the local one when Graph reports it.
-async function uploadFile(base: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
+async function uploadFile(root: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
   const startSize = statSync(localPath).size;
   const hash = createHash("sha256");
   const enc = encPath(rel);
@@ -282,7 +301,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
     if (data.length !== startSize) err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
     hash.update(data);
     const res = await checkRaw(
-      await graphRawRequest(`${base}/root:/${enc}:/content?@microsoft.graph.conflictBehavior=${replace ? "replace" : "fail"}`, {
+      await graphRawRequest(`${root}:/${enc}:/content?@microsoft.graph.conflictBehavior=${replace ? "replace" : "fail"}`, {
         method: "PUT",
         headers,
         body: data,
@@ -304,7 +323,7 @@ async function uploadFile(base: string, rel: string, localPath: string, replace:
 
   const sessionHeaders: Record<string, string> = {};
   if (ifMatch) sessionHeaders["If-Match"] = ifMatch;
-  const session = await graphRequest(`${base}/root:/${enc}:/createUploadSession`, {
+  const session = await graphRequest(`${root}:/${enc}:/createUploadSession`, {
     method: "POST",
     headers: sessionHeaders,
     body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": replace ? "replace" : "fail" } }),
@@ -524,17 +543,17 @@ export function registerFiles(program: Command) {
     .option("--drive <drive>", "me (your OneDrive) or ricky (Ricky Bureau - GXB shared library)", "me")
     .action(async (query, opts) => {
       try {
-        const base = await driveBase(opts.drive);
+        const d = await resolveDrive(opts.drive);
         const sq = encodeURIComponent(query.replace(/'/g, "''"));
         // Follow @odata.nextLink so large result sets are not cut off.
         const results: any[] = [];
-        let url: string | null = `${base}/search(q='${sq}')?$top=50`;
+        let url: string | null = `${d.searchBase}/search(q='${sq}')?$top=50`;
         for (let hops = 0; url && hops < 20; hops++) {
           const data = await graphRequest(url);
           results.push(...(data?.value || []));
           url = data?.["@odata.nextLink"] || null;
         }
-        out({ query, drive: opts.drive, count: results.length, results: results.map(slim) });
+        out({ query, drive: opts.drive, count: results.length, results: results.map((i) => slim(i, d.prefix)) });
       } catch (e: any) {
         graphFail(e);
       }
@@ -547,21 +566,21 @@ export function registerFiles(program: Command) {
     .option("--drive <drive>", "me or ricky", "me")
     .action(async (p, opts) => {
       try {
-        const base = await driveBase(opts.drive);
+        const d = await resolveDrive(opts.drive);
         const isRoot = p === "/" || p.trim() === "";
         const enc = isRoot ? "" : encPath(p);
         const select = "$select=name,id,size,folder,file,lastModifiedDateTime,parentReference,webUrl";
         // Follow @odata.nextLink so folders over the page size are complete.
         const items: any[] = [];
         let url: string | null = enc
-          ? `${base}/root:/${enc}:/children?${select}`
-          : `${base}/root/children?${select}`;
+          ? `${d.root}:/${enc}:/children?${select}`
+          : `${d.root}/children?${select}`;
         for (let hops = 0; url && hops < 50; hops++) {
           const data = await graphRequest(url);
           items.push(...(data?.value || []));
           url = data?.["@odata.nextLink"] || null;
         }
-        out({ drive: opts.drive, path: p, count: items.length, items: items.map(slim) });
+        out({ drive: opts.drive, path: p, count: items.length, items: items.map((i) => slim(i, d.prefix)) });
       } catch (e: any) {
         graphFail(e);
       }
@@ -574,9 +593,9 @@ export function registerFiles(program: Command) {
     .option("--drive <drive>", "me or ricky", "me")
     .action(async (p, opts) => {
       try {
-        const base = await driveBase(opts.drive);
-        const item = await graphRequest(itemPath(base, p));
-        out({ drive: opts.drive, ...slim(item) });
+        const d = await resolveDrive(opts.drive);
+        const item = await graphRequest(itemPath(d.root, p));
+        out({ drive: opts.drive, ...slim(item, d.prefix) });
       } catch (e: any) {
         graphFail(e);
       }
@@ -590,10 +609,10 @@ export function registerFiles(program: Command) {
     .option("--out <dir>", "Cache root directory", DEFAULT_CACHE)
     .action(async (p, opts) => {
       try {
-        const base = await driveBase(opts.drive);
+        const { root } = await resolveDrive(opts.drive);
         const enc = encPath(p);
         if (!enc) err("Give a file path, e.g. 10_Products/notes.txt", "BAD_PATH");
-        const meta = await graphRequest(`${base}/root:/${enc}`);
+        const meta = await graphRequest(`${root}:/${enc}`);
         if (meta.folder) err("That path is a folder; `files get` works on files only", "IS_FOLDER");
 
         const cacheRoot = resolvePath(expandTilde(opts.out));
@@ -613,7 +632,7 @@ export function registerFiles(program: Command) {
         }
         if (existsSync(target) && lstatSync(target).isSymbolicLink()) err(`Refusing to follow the symlink at ${target}`, "PATH_ESCAPE");
 
-        const res = await checkRaw(await graphRawRequest(`${base}/root:/${enc}:/content`), p);
+        const res = await checkRaw(await graphRawRequest(`${root}:/${enc}:/content`), p);
         mkdirChmodChain(realRoot, dirname(target));
         if (!realpathSync(dirname(target)).startsWith(realRoot + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
 
@@ -670,7 +689,7 @@ export function registerFiles(program: Command) {
     .option("--mkdir", "Create missing parent folders")
     .action(async (local, p, opts) => {
       try {
-        const base = await driveBase(opts.drive);
+        const { root } = await resolveDrive(opts.drive);
         const enc = encPath(p);
         if (!enc) err("Give a remote path, e.g. 10_Products/notes.txt", "BAD_PATH");
         const localPath = resolvePath(expandTilde(local));
@@ -680,11 +699,11 @@ export function registerFiles(program: Command) {
         if (segments.length > 1) {
           const dir = segments.slice(0, -1);
           try {
-            await graphRequest(itemPath(base, dir.join("/")));
+            await graphRequest(itemPath(root, dir.join("/")));
           } catch (e: any) {
             if (!isNotFound(e)) throw e;
             if (!opts.mkdir) err(`Remote folder "${dir.join("/")}" does not exist; pass --mkdir to create it`, "PARENT_MISSING");
-            await ensureFolder(base, dir);
+            await ensureFolder(root, dir);
           }
         }
 
@@ -692,7 +711,7 @@ export function registerFiles(program: Command) {
         // never a folder (conflictBehavior=replace on a file below).
         let replace = false;
         try {
-          const existing = await graphRequest(itemPath(base, p));
+          const existing = await graphRequest(itemPath(root, p));
           if (existing.folder) err(`Remote path "${p}" is a folder; put only replaces files`, "IS_FOLDER");
           if (!opts.force) err(`"${p}" already exists; pass --force to replace the file`, "ALREADY_EXISTS");
           replace = true;
@@ -700,7 +719,7 @@ export function registerFiles(program: Command) {
           if (!isNotFound(e)) throw e;
         }
 
-        const r = await uploadFile(base, p, localPath, replace);
+        const r = await uploadFile(root, p, localPath, replace);
         out({ drive: opts.drive, path: p, localPath, size: r.size, sha256: r.sha256, id: r.id, uploadedVia: r.mode, replaced: replace });
       } catch (e: any) {
         graphFail(e);
@@ -720,7 +739,7 @@ export function registerFiles(program: Command) {
     .action(async (dir, p, opts) => {
       try {
         if (!!opts.dryRun === !!opts.apply) err("Give exactly one of --dry-run or --apply", "BAD_MODE");
-        const base = await driveBase(opts.drive);
+        const { root } = await resolveDrive(opts.drive);
         const localDir = resolvePath(expandTilde(dir));
         if (!existsSync(localDir) || !statSync(localDir).isDirectory()) err(`No local folder: ${localDir}`, "LOCAL_MISSING");
         // Validate the remote target the same way as every other subcommand.
@@ -767,7 +786,7 @@ export function registerFiles(program: Command) {
           }
           let remote: any = null;
           try {
-            remote = await graphRequest(itemPath(base, remoteRel));
+            remote = await graphRequest(itemPath(root, remoteRel));
           } catch (e: any) {
             if (!isNotFound(e)) throw e;
           }
@@ -834,27 +853,27 @@ export function registerFiles(program: Command) {
         const toUpload = plan.filter((u) => !u.skipped && !u.conflict && (u.changed || u.eTag === undefined));
         if (opts.apply) {
           try {
-            await graphRequest(itemPath(base, normalizedTarget));
+            await graphRequest(itemPath(root, normalizedTarget));
           } catch (e: any) {
             if (!isNotFound(e)) throw e;
-            await ensureFolder(base, normalizedTarget.split("/").filter(Boolean));
+            await ensureFolder(root, normalizedTarget.split("/").filter(Boolean));
           }
           for (const u of toUpload) {
             const relSegments = u.remote.split("/").filter(Boolean);
             const dir = relSegments.slice(0, -1);
             if (dir.length) {
               try {
-                await graphRequest(itemPath(base, dir.join("/")));
+                await graphRequest(itemPath(root, dir.join("/")));
               } catch (e: any) {
                 if (!isNotFound(e)) throw e;
-                await ensureFolder(base, dir);
+                await ensureFolder(root, dir);
               }
             }
             try {
               // Replace only files we saw older remotes for, and send If-Match
               // with the eTag from the plan so an item that changed after the
               // plan fails with 412 instead of overwriting.
-              const r = await uploadFile(base, u.remote, join(localDir, u.file), !!u.changed, u.eTag);
+              const r = await uploadFile(root, u.remote, join(localDir, u.file), !!u.changed, u.eTag);
               u.id = r.id;
               u.sha256 = r.sha256;
               u.uploadedVia = r.mode;
