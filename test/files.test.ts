@@ -122,6 +122,14 @@ beforeEach(() => {
     if (q === "/me/drive/root:/docs/report.pdf") return driveItem;
     if (q === "/me/drive/root:/10_Products/report.pdf:/content") return new Response("file-body-contents");
     if (q === "/drives/DRIVE1/items/GXB1:/docs/report.pdf:/content") return new Response("ricky-file-body-contents");
+    // sync lists each remote folder once: answer from remoteItems.
+    if (q.startsWith("/me/drive/root:/") && q.endsWith(":/children") && method === "GET") {
+      const dir = decodeURIComponent(q.slice("/me/drive/root:/".length, -":/children".length));
+      const value = Object.entries(remoteItems)
+        .filter(([k]) => k.startsWith(dir + "/") && !k.slice(dir.length + 1).includes("/"))
+        .map(([k, v]) => ({ ...v, name: k.split("/").pop() }));
+      return { value };
+    }
     if (q.startsWith("/me/drive/root:/")) {
       const rel = q.slice("/me/drive/root:/".length);
       if (rel in remoteItems) return remoteItems[rel];
@@ -452,6 +460,54 @@ test("sync skips names OneDrive does not allow (':' etc.) and still uploads the 
     const puts = calls.filter((c) => c.method === "PUT").map((c) => c.path.split("?")[0]);
     assert.deepEqual(puts, ["/me/drive/root:/syncdst/ok.txt:/content"], "no Graph call for the bad names");
     assert.equal(calls.some((c) => c.path.includes("handoff") || c.path.includes("what")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sync lists each remote folder once (no GET per file) and skips remote-only folders", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odtree-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(join(src, "sub"), { recursive: true });
+    writeFileSync(join(src, "a.txt"), "same");
+    writeFileSync(join(src, "sub", "b.txt"), "same");
+    const sha1 = createHash("sha1").update("same").digest("hex").toUpperCase();
+    remoteItems = {
+      "syncdst/a.txt": { id: "A", size: 4, file: { hashes: { sha1Hash: sha1 } } },
+      "syncdst/sub": { id: "S", folder: {} },
+      "syncdst/sub/b.txt": { id: "B", size: 4, file: { hashes: { sha1Hash: sha1 } } },
+      "syncdst/remote-only": { id: "R", folder: {} },
+    };
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.data.unchanged, 2);
+    assert.deepEqual(
+      calls.map((c) => c.path.split("?")[0]),
+      ["/me/drive/root:/syncdst:/children", "/me/drive/root:/syncdst/sub:/children"]
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sync waits and retries when the folder listing is throttled (429)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odtree429-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "a.txt"), "x");
+    let throttled = 0;
+    setTransportForTests(async (path) => {
+      calls.push({ path, method: "GET" });
+      if (path.split("?")[0] === "/me/drive/root:/syncdst:/children" && throttled++ < 2)
+        throw new GraphError(429, "Graph API 429: slow down", 0);
+      if (path.split("?")[0] === "/me/drive/root:/syncdst:/children") return { value: [] };
+      throw new GraphError(404, "Graph API 404: item not found");
+    });
+    const o = await run("sync", src, "syncdst", "--dry-run");
+    assert.equal(o.ok, true);
+    assert.equal(o.data.uploads, 1);
+    assert.equal(throttled, 3, "two 429s, then a good page");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

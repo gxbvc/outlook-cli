@@ -285,6 +285,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Remote paths are case-insensitive; macOS may store names decomposed.
+function remoteKey(rel: string): string {
+  return rel.normalize("NFC").toLowerCase();
+}
+
+// Every item under target, keyed by remoteKey(path relative to the drive
+// root). One paged children listing per remote folder: a GET per local file
+// is thousands of calls for a big folder and Graph throttles it (429). A 429
+// here waits Retry-After (max 60 s) and retries, up to 5 times per page.
+// wantDir(rel): go into this remote folder? (sync skips folders with no local twin.)
+async function listRemoteTree(root: string, target: string, wantDir: (rel: string) => boolean = () => true): Promise<Map<string, any>> {
+  const items = new Map<string, any>();
+  const select = "$select=name,id,size,folder,file,lastModifiedDateTime,eTag,cTag";
+  const dirs = [target];
+  while (dirs.length) {
+    const dir = dirs.shift()!;
+    let url: string | null = dir ? `${itemPath(root, dir)}:/children?${select}` : `${root}/children?${select}`;
+    for (let hops = 0; url && hops < 1000; hops++) {
+      let data: any;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          data = await graphRequest(url);
+          break;
+        } catch (e: any) {
+          if (dir === target && hops === 0 && isNotFound(e)) return items; // target not created yet
+          if (!(e instanceof GraphError && e.status === 429) || attempt >= 5) throw e;
+          await sleep(retryDelayMs(e.retryAfter != null ? String(e.retryAfter) : null, attempt));
+        }
+      }
+      for (const item of data?.value || []) {
+        const rel = dir ? `${dir}/${item.name}` : item.name;
+        items.set(remoteKey(rel), item);
+        if (item.folder && wantDir(rel)) dirs.push(rel);
+      }
+      url = data?.["@odata.nextLink"] || null;
+    }
+  }
+  return items;
+}
+
 // Upload one local file. Small: single PUT with conflictBehavior on the URL.
 // Large: an upload session, streamed one chunk at a time (never the whole file
 // in memory). Chunks retry on 429/5xx/network errors (max 3, Retry-After
@@ -778,6 +818,12 @@ export function registerFiles(program: Command) {
         // hold both spellings, so this catches them before anything uploads).
         const caseCollisions = detectCaseCollisions(localFiles);
 
+        const remoteDirs = new Set<string>();
+        for (const rel of localFiles) {
+          const segs = (rootTarget ? rel : `${normalizedTarget}/${rel}`).split("/");
+          for (let i = 1; i < segs.length; i++) remoteDirs.add(remoteKey(segs.slice(0, i).join("/")));
+        }
+        const remoteTree = await listRemoteTree(root, rootTarget ? "" : normalizedTarget, (rel) => remoteDirs.has(remoteKey(rel)));
         const plan: any[] = [];
         let unchanged = 0;
         for (const rel of localFiles) {
@@ -794,12 +840,7 @@ export function registerFiles(program: Command) {
             plan.push({ file: rel, remote: remoteRel, conflict: "case-only name collision with another local file; upload refused" });
             continue;
           }
-          let remote: any = null;
-          try {
-            remote = await graphRequest(itemPath(root, remoteRel));
-          } catch (e: any) {
-            if (!isNotFound(e)) throw e;
-          }
+          const remote: any = remoteTree.get(remoteKey(remoteRel)) || null;
           if (remote?.folder) {
             plan.push({ file: rel, remote: remoteRel, skipped: "remote path is a folder; never replaced" });
             continue;
