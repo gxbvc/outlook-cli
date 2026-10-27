@@ -109,6 +109,16 @@ function badSegmentReason(rel: string): string | null {
   return null;
 }
 
+// Characters OneDrive refuses in a name (a ":" also breaks Graph's root:/path:
+// syntax), and leading or trailing spaces. sync skips and reports these.
+function oneDriveNameProblem(rel: string): string | null {
+  for (const seg of rel.split("/")) {
+    if (/["*:<>?|]/.test(seg)) return `OneDrive does not allow " * : < > ? | in "${seg}"`;
+    if (seg !== seg.trim()) return `OneDrive does not allow a leading or trailing space in "${seg}"`;
+  }
+  return null;
+}
+
 function normalizeRel(rel: string): string {
   let p = rel;
   if (p.startsWith("/")) p = p.slice(1);
@@ -774,7 +784,7 @@ export function registerFiles(program: Command) {
           const remoteRel = rootTarget ? rel : `${normalizedTarget}/${rel}`;
           // One bad local file name (a backslash or control character is legal
           // on macOS) is skipped and reported, not an abort of the whole sync.
-          const badName = badSegmentReason(remoteRel);
+          const badName = badSegmentReason(remoteRel) || oneDriveNameProblem(remoteRel);
           if (badName) {
             plan.push({ file: rel, remote: remoteRel, skipped: `bad file name: ${badName}` });
             continue;

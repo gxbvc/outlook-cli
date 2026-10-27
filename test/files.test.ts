@@ -435,6 +435,28 @@ test("sync dry-run plans uploads (new, changed, unchanged, folder) without uploa
   }
 });
 
+test("sync skips names OneDrive does not allow (':' etc.) and still uploads the rest", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "odsync-"));
+  try {
+    const src = join(dir, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "2026-05-21T04:04:02Z-handoff.md"), "colon");
+    writeFileSync(join(src, "what?.txt"), "question");
+    writeFileSync(join(src, "ok.txt"), "fine");
+    const o = await run("sync", src, "syncdst", "--apply");
+    assert.equal(o.ok, true);
+    const byFile = Object.fromEntries(o.data.files.map((f: any) => [f.file, f]));
+    assert.match(byFile["2026-05-21T04:04:02Z-handoff.md"].skipped, /OneDrive does not allow/);
+    assert.match(byFile["what?.txt"].skipped, /OneDrive does not allow/);
+    assert.equal(o.data.uploads, 1);
+    const puts = calls.filter((c) => c.method === "PUT").map((c) => c.path.split("?")[0]);
+    assert.deepEqual(puts, ["/me/drive/root:/syncdst/ok.txt:/content"], "no Graph call for the bad names");
+    assert.equal(calls.some((c) => c.path.includes("handoff") || c.path.includes("what")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("sync apply uploads only new and changed files, never deletes remote", async () => {
   const dir = mkdtempSync(join(tmpdir(), "odsync-"));
   try {
