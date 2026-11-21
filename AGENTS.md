@@ -91,6 +91,8 @@ outlook-cli files sync LOCAL_DIR PATH [--drive me|shared] --dry-run|--apply  # m
 
 **Agent footer:** every email from `emails send`, `emails reply`, and `emails forward` ends with "Sent from my agent 🤖" (gray footer in HTML; no opt-out, never doubled). This marks it as agent-written, like the 🤖 prefix in slack-cli and imessages-cli. Do not add it yourself. Drafts get no footer, because the mailbox owner reviews and sends those. Plain `--text` replies and forwards are sent as HTML with `<br>` line breaks, because Graph collapses newlines in a reply comment.
 
+**Body from a file:** `--text-file PATH` or `--html-file PATH` replaces `--text` / `--html` on `emails send`, `emails reply`, `emails forward`, `drafts create`, `drafts reply`, `drafts forward` and `drafts update`. Use it for long or sensitive bodies: the body then never appears in the process list or shell history. The file must be a regular file (no symlink or FIFO), mode 0600 or narrower, at most 1 MB, and UTF-8. Only one of the four body options per command. A refused file ends the command with code `BODY_FILE_REFUSED` before any Graph call or send-log line. `calendar create/update --html` has no file form yet.
+
 ## Send log
 
 Every command that makes Graph send mail writes to a local log first: `emails send`, `emails reply` (all forms), `emails forward`, `drafts send` (also `--at`), `calendar create` with attendees, `calendar update`, `calendar cancel`, `calendar delete` and `calendar forward`. Drafts that are only created or updated are not logged.

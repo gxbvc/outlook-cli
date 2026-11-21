@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { graphRequest, out, err, owaUrl } from "../graph.js";
 import { loggedSend, failCode } from "../sendlog.js";
+import { applyBodyFilesOrExit } from "../bodyfile.js";
 import {
   loadAll,
   hasLarge,
@@ -46,10 +47,13 @@ export function registerDrafts(program: Command) {
     .requiredOption("--subject <subject>", "Subject line")
     .option("--text <text>", "Plain text body")
     .option("--html <html>", "HTML body")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--cc <addresses>", "Comma-separated CC")
     .option("--bcc <addresses>", "Comma-separated BCC")
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const body: any = {
           subject: opts.subject,
@@ -125,9 +129,12 @@ export function registerDrafts(program: Command) {
     .requiredOption("--id <id>", "Message ID to reply to")
     .option("--text <text>", "Plain text body")
     .option("--html <html>", "HTML body")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--reply-all", "Reply to all")
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const endpoint = opts.replyAll ? "createReplyAll" : "createReply";
         const body: any = {};
@@ -156,10 +163,13 @@ export function registerDrafts(program: Command) {
     .option("--to <addresses>", "Comma-separated recipients")
     .option("--text <text>", "Plain text note above the forwarded message")
     .option("--html <html>", "HTML note above the forwarded message")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--cc <addresses>", "Comma-separated CC")
     .option("--bcc <addresses>", "Comma-separated BCC")
     .option("--attach <path>", "Extra file to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const addrs = (s?: string) =>
           s ? s.split(",").map((e: string) => ({ emailAddress: { address: e.trim() } })) : undefined;
@@ -190,10 +200,13 @@ export function registerDrafts(program: Command) {
     .option("--subject <subject>", "Subject line")
     .option("--text <text>", "Plain text body")
     .option("--html <html>", "HTML body")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--cc <addresses>", "Comma-separated CC")
     .option("--bcc <addresses>", "Comma-separated BCC")
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const body: any = {};
         if (opts.subject) body.subject = opts.subject;

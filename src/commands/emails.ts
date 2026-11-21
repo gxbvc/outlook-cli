@@ -12,6 +12,7 @@ import {
 import { footedContent, footedComment } from "../footer.js";
 import { collectAddrs, hasAddedRecipients, replyWithRecipients, forwardMessage } from "../reply.js";
 import { loggedSend, failCode } from "../sendlog.js";
+import { applyBodyFilesOrExit } from "../bodyfile.js";
 
 const collect = (v: string, acc: string[]) => { acc.push(v); return acc; };
 
@@ -67,10 +68,13 @@ export function registerEmails(program: Command) {
     .requiredOption("--subject <subject>", "Subject line")
     .option("--text <text>", "Plain text body")
     .option("--html <html>", "HTML body")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--cc <addresses>", "Comma-separated CC")
     .option("--bcc <addresses>", "Comma-separated BCC")
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const toRecipients = opts.to.split(",").map((e: string) => ({
           emailAddress: { address: e.trim() },
@@ -165,12 +169,15 @@ export function registerEmails(program: Command) {
     .requiredOption("--id <id>", "Message ID to reply to")
     .option("--text <text>", "Plain text reply")
     .option("--html <html>", "HTML reply")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--reply-all", "Reply to all recipients")
     .option("--to <addresses>", "Add recipients to the reply (comma-separated, repeatable)", collectAddrs, [])
     .option("--cc <addresses>", "Add CC recipients (comma-separated, repeatable)", collectAddrs, [])
     .option("--bcc <addresses>", "Add BCC recipients (comma-separated, repeatable)", collectAddrs, [])
     .option("--attach <path>", "File to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         const attachPaths: string[] = opts.attach || [];
 
@@ -233,10 +240,13 @@ export function registerEmails(program: Command) {
     .option("--to <addresses>", "Recipients (comma-separated, repeatable; required)", collectAddrs, [])
     .option("--text <text>", "Plain text note above the forwarded message")
     .option("--html <html>", "HTML note above the forwarded message")
+    .option("--text-file <path>", "Plain text body from a file (0600, regular file, max 1 MB; not with --text/--html)")
+    .option("--html-file <path>", "HTML body from a file (0600, regular file, max 1 MB; not with --text/--html)")
     .option("--cc <addresses>", "CC (comma-separated, repeatable)", collectAddrs, [])
     .option("--bcc <addresses>", "BCC (comma-separated, repeatable)", collectAddrs, [])
     .option("--attach <path>", "Extra file to attach (repeatable)", collect, [])
     .action(async (opts) => {
+      applyBodyFilesOrExit(opts);
       try {
         // createForward → attach extra files → send. The original's attachments come along.
         const { attached } = await forwardMessage({ ...opts, attach: opts.attach || [] });
