@@ -1,0 +1,995 @@
+import { Command } from "commander";
+import { chmodSync, closeSync, createWriteStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { createHash } from "crypto";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "path";
+import { homedir } from "os";
+import { TOKENS_DIR } from "../config.js";
+import { GraphError, graphRawRequest, graphRequest, out, err } from "../graph.js";
+import { QuickXorHash } from "../quickxor.js";
+
+// OneDrive and SharePoint files via Graph. Read: search, ls, info, get.
+// Upload: put, sync (needs Files.ReadWrite.All on top of Files.Read.All and
+// Sites.Read.All; re-run `outlook-cli auth` once those scopes are granted).
+// Never deletes or moves anything.
+
+const DEFAULT_CACHE = join(homedir(), "tmp", "onedrive-cache");
+// --drive shared: one folder in another user's OneDrive, shared with this account. It is
+// not a SharePoint site, so a site search never finds it. The owner, the library name
+// (the cache key) and the folder come from .env; nothing is hardcoded.
+export const SHARED_DRIVE_KEYS = [
+  "OUTLOOK_SHARED_DRIVE_UPN",
+  "OUTLOOK_SHARED_DRIVE_LIBRARY",
+  "OUTLOOK_SHARED_DRIVE_FOLDER",
+] as const;
+
+function sharedDriveConfig(): { upn: string; library: string; folder: string } {
+  const missing = SHARED_DRIVE_KEYS.filter((k) => !process.env[k]?.trim());
+  if (missing.length) {
+    err(`--drive shared is not set up: add ${missing.join(", ")} to .env (see .env.example)`, "SHARED_DRIVE_NOT_CONFIGURED");
+  }
+  const folder = process.env.OUTLOOK_SHARED_DRIVE_FOLDER!.trim();
+  if (folder.includes("/")) err("OUTLOOK_SHARED_DRIVE_FOLDER must be one folder name at the drive root", "SHARED_DRIVE_NOT_CONFIGURED");
+  return {
+    upn: process.env.OUTLOOK_SHARED_DRIVE_UPN!.trim(),
+    library: process.env.OUTLOOK_SHARED_DRIVE_LIBRARY!.trim(),
+    folder,
+  };
+}
+
+// Old drive names that still work. "ricky" was the first name of --drive shared.
+const DRIVE_ALIASES: Record<string, string> = { ricky: "shared" };
+export function canonicalDrive(drive: string): string {
+  return DRIVE_ALIASES[drive] || drive;
+}
+const DRIVE_HELP = "me (your OneDrive) or shared (the shared folder set in .env; alias: ricky)";
+
+// Files over 4 MiB upload through a Graph upload session in chunks; the chunk
+// size must be a multiple of 320 KiB, so 5 MiB it is.
+const UPLOAD_SESSION_THRESHOLD = 4 * 1024 * 1024;
+const UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
+
+// --drive shared resolves the shared folder's drive id and item id once and
+// caches only the ids here (never tokens or file data).
+function driveCacheFile(): string {
+  return process.env.OUTLOOK_DRIVE_CACHE || join(TOKENS_DIR, "drive-ids.json");
+}
+
+function readDriveCache(): Record<string, any> {
+  try {
+    return JSON.parse(readFileSync(driveCacheFile(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeDriveCache(cache: Record<string, any>): void {
+  mkdirSync(dirname(driveCacheFile()), { recursive: true });
+  writeFileSync(driveCacheFile(), JSON.stringify(cache, null, 2) + "\n", { mode: 0o600 });
+}
+
+async function sharedFolder(): Promise<{ driveId: string; itemId: string; folder: string }> {
+  const { upn, library: SHARED_LIBRARY_NAME, folder: SHARED_FOLDER } = sharedDriveConfig();
+  const cache = readDriveCache();
+  const cached = cache[SHARED_LIBRARY_NAME];
+  if (cached && typeof cached === "object" && cached.driveId && cached.itemId) {
+    // Re-verify once per run: is the cached item still the shared folder?
+    try {
+      const item = await graphRequest(`/drives/${cached.driveId}/items/${cached.itemId}`);
+      if (item?.id === cached.itemId && item.folder && item.name === SHARED_FOLDER) {
+        return { driveId: cached.driveId, itemId: cached.itemId, folder: SHARED_FOLDER };
+      }
+    } catch (e: any) {
+      if (!(e instanceof GraphError)) throw e;
+      // 404 or access error: treat as stale and re-resolve below.
+    }
+    delete cache[SHARED_LIBRARY_NAME];
+    writeDriveCache(cache);
+  } else if (cached) {
+    // Older releases cached a site drive id (string or { driveId, siteId }).
+    delete cache[SHARED_LIBRARY_NAME];
+  }
+  // Exact folder only. A fuzzy fallback would cache the wrong folder and
+  // later puts/syncs would write somewhere unrelated.
+  let item: any = null;
+  try {
+    item = await graphRequest(`/users/${encodeURIComponent(upn)}/drive/root:/${encodeURIComponent(SHARED_FOLDER)}`);
+  } catch (e: any) {
+    if (!isNotFound(e)) throw e;
+  }
+  if (!item?.folder || item.name !== SHARED_FOLDER || !item.parentReference?.driveId)
+    err(`Folder "${SHARED_FOLDER}" not found in ${upn}'s OneDrive (${SHARED_LIBRARY_NAME}).`, "LIBRARY_NOT_FOUND");
+  const ids = { driveId: item.parentReference.driveId, itemId: item.id };
+  cache[SHARED_LIBRARY_NAME] = ids;
+  writeDriveCache(cache);
+  return { ...ids, folder: SHARED_FOLDER };
+}
+
+// root: the Graph item every path is relative to ("/me/drive/root" or the
+// shared folder's item). Paths are "${root}:/a/b". searchBase scopes search.
+// prefix: the root folder's own path in its drive, stripped from item paths.
+type DriveRoot = { root: string; searchBase: string; prefix: string };
+
+async function resolveDrive(drive: string): Promise<DriveRoot> {
+  // The global --user remaps /me to another mailbox; files commands do not support it.
+  if (process.env.OUTLOOK_USER) err("files does not support --user", "USER_UNSUPPORTED");
+  if (drive === "me") return { root: "/me/drive/root", searchBase: "/me/drive", prefix: "" };
+  if (canonicalDrive(drive) === "shared") {
+    const { driveId, itemId, folder } = await sharedFolder();
+    const root = `/drives/${driveId}/items/${itemId}`;
+    return { root, searchBase: root, prefix: folder };
+  }
+  err(`Unknown drive "${drive}" (use me or shared)`, "BAD_DRIVE");
+}
+
+// Encode each path segment so spaces, #, % and unicode survive the URL, but
+// first reject anything that could escape the drive or the local cache: empty
+// segments, ".", "..", backslashes and control characters. WHATWG URL parsing
+// would otherwise resolve dot segments out of the encoded path. ONE leading
+// and ONE trailing "/" are allowed and stripped; "" or "/" means the root.
+function badSegmentReason(rel: string): string | null {
+  for (const seg of rel.split("/")) {
+    if (!seg || seg === "." || seg === "..") return `bad path segment "${seg}"`;
+    if (seg.includes("\\") || /[\u0000-\u001f\u007f]/.test(seg)) return `bad character in path segment "${seg}"`;
+  }
+  return null;
+}
+
+// Characters OneDrive refuses in a name (a ":" also breaks Graph's root:/path:
+// syntax), and leading or trailing spaces. sync skips and reports these.
+function oneDriveNameProblem(rel: string): string | null {
+  for (const seg of rel.split("/")) {
+    if (/["*:<>?|]/.test(seg)) return `OneDrive does not allow " * : < > ? | in "${seg}"`;
+    if (seg !== seg.trim()) return `OneDrive does not allow a leading or trailing space in "${seg}"`;
+  }
+  return null;
+}
+
+function normalizeRel(rel: string): string {
+  let p = rel;
+  if (p.startsWith("/")) p = p.slice(1);
+  if (p.endsWith("/")) p = p.slice(0, -1);
+  return p;
+}
+
+function encPath(rel: string): string {
+  const p = normalizeRel(rel);
+  if (p === "") return "";
+  const reason = badSegmentReason(p);
+  if (reason) err(`Bad path: ${reason} in "${rel}"`, "BAD_PATH");
+  return p.split("/").map(encodeURIComponent).join("/");
+}
+
+// Graph item path relative to the drive root ("root:/segment/segment").
+function itemPath(root: string, rel: string): string {
+  const enc = encPath(rel);
+  return enc ? `${root}:/${enc}` : root;
+}
+
+function relPathOf(item: any, prefix = ""): string {
+  const parent = item.parentReference?.path || "";
+  const idx = parent.indexOf("root:");
+  let base = idx >= 0 ? parent.slice(idx + 5).replace(/^\//, "") : "";
+  if (prefix && base === prefix) base = "";
+  else if (prefix && base.startsWith(prefix + "/")) base = base.slice(prefix.length + 1);
+  return base ? `${base}/${item.name}` : item.name;
+}
+
+// Show names, ids, sizes and hashes only. Never file contents.
+function slim(item: any, prefix = "") {
+  return {
+    name: item.name,
+    id: item.id,
+    type: item.folder ? "folder" : "file",
+    size: item.size,
+    path: relPathOf(item, prefix),
+    lastModified: item.lastModifiedDateTime,
+    hash: item.file?.hashes?.quickXorHash || item.file?.hashes?.sha1Hash || null,
+    webUrl: item.webUrl,
+  };
+}
+
+function graphFail(e: any): never {
+  const status = e instanceof GraphError ? e.status : 0;
+  if (status === 404) err("Not found in this drive (404). Check the path and --drive.", "NOT_FOUND");
+  if (status === 403)
+    err(
+      "Access denied (403). The signed-in token lacks the files scopes (Files.Read.All, Sites.Read.All, Files.ReadWrite.All). Grant them on the Azure app if not yet, then run outlook-cli auth.",
+      "CONSENT_REQUIRED"
+    );
+  if (status === 429)
+    err(
+      /after \d+ retries/.test(e.message)
+        ? e.message
+        : `Throttled (429). Retry after ${e.retryAfter ?? "unknown"} seconds.`,
+      "THROTTLED"
+    );
+  throw e;
+}
+
+function expandTilde(p: string): string {
+  return p.replace(/^~(?=\/|$)/, homedir());
+}
+
+// Create the folder chain from root down to dir and chmod every level 700 —
+// a cache root or drive folder that already existed keeps its old mode otherwise.
+// Never follows a symlink: refuses instead.
+function mkdirChmodChain(root: string, dir: string): void {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const rel = relative(root, dir);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return;
+  let cur = root;
+  for (const seg of rel.split(sep).filter(Boolean)) {
+    cur = join(cur, seg);
+    if (existsSync(cur) && lstatSync(cur).isSymbolicLink()) err(`Refusing to follow the symlink at ${cur}`, "PATH_ESCAPE");
+    mkdirSync(cur, { recursive: true, mode: 0o700 });
+    chmodSync(cur, 0o700);
+  }
+}
+
+// Turn a raw Response (streaming download) into a GraphError when not ok.
+async function checkRaw(res: Response, path: string): Promise<Response> {
+  if (res.ok) return res;
+  const body = await res.text();
+  const retryAfter = res.headers.get("Retry-After");
+  throw new GraphError(res.status, `Graph API ${res.status} ${path}: ${body}`, retryAfter ? parseInt(retryAfter, 10) : null);
+}
+
+function isNotFound(e: any): boolean {
+  return e instanceof GraphError && e.status === 404;
+}
+
+// Create missing folders one segment at a time (conflictBehavior fail: never
+// replaces an existing folder). Only called when the user asked for it.
+async function ensureFolder(root: string, segments: string[]): Promise<void> {
+  let cur = "";
+  for (const seg of segments) {
+    const item = cur ? `${root}:/${cur}/${encodeURIComponent(seg)}` : `${root}:/${encodeURIComponent(seg)}`;
+    const parent = cur ? `${root}:/${cur}` : root;
+    try {
+      await graphRequest(item);
+    } catch (e: any) {
+      if (!isNotFound(e)) throw e;
+      await graphRequest(`${parent}/children`, {
+        method: "POST",
+        body: JSON.stringify({ name: seg, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
+      });
+    }
+    cur = cur ? `${cur}/${encodeURIComponent(seg)}` : encodeURIComponent(seg);
+  }
+}
+
+// Stream the sha256 of a local file.
+function sha256Of(localPath: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
+// Stream the sha1 of a local file (fallback for personal OneDrive items).
+function sha1Of(localPath: string): string {
+  const hash = createHash("sha1");
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex").toUpperCase();
+}
+
+// Honor Graph's Retry-After (seconds or HTTP-date), capped at 60 s; fall back
+// to exponential backoff when the header is absent.
+export function retryDelayMs(header: string | null, attempt: number): number {
+  const CAP = 60_000;
+  if (header) {
+    const secs = parseInt(header, 10);
+    if (!isNaN(secs)) return Math.min(secs * 1000, CAP);
+    const at = Date.parse(header);
+    if (!isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), CAP);
+  }
+  return Math.min(200 * 2 ** attempt, CAP);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Remote paths are case-insensitive; macOS may store names decomposed.
+function remoteKey(rel: string): string {
+  return rel.normalize("NFC").toLowerCase();
+}
+
+// Every item under target, keyed by remoteKey(path relative to the drive
+// root). One paged children listing per remote folder: a GET per local file
+// is thousands of calls for a big folder and Graph throttles it (429). A 429
+// here waits Retry-After (max 60 s) and retries, up to 5 times per page.
+// wantDir(rel): go into this remote folder? (sync skips folders with no local twin.)
+async function listRemoteTree(root: string, target: string, wantDir: (rel: string) => boolean = () => true): Promise<Map<string, any>> {
+  const items = new Map<string, any>();
+  const select = "$select=name,id,size,folder,file,lastModifiedDateTime,eTag,cTag";
+  const dirs = [target];
+  while (dirs.length) {
+    const dir = dirs.shift()!;
+    let url: string | null = dir ? `${itemPath(root, dir)}:/children?${select}` : `${root}/children?${select}`;
+    for (let hops = 0; url && hops < 1000; hops++) {
+      let data: any;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          data = await graphRequest(url);
+          break;
+        } catch (e: any) {
+          if (dir === target && hops === 0 && isNotFound(e)) return items; // target not created yet
+          if (!(e instanceof GraphError && e.status === 429) || attempt >= 5) throw e;
+          await sleep(retryDelayMs(e.retryAfter != null ? String(e.retryAfter) : null, attempt));
+        }
+      }
+      for (const item of data?.value || []) {
+        const rel = dir ? `${dir}/${item.name}` : item.name;
+        items.set(remoteKey(rel), item);
+        if (item.folder && wantDir(rel)) dirs.push(rel);
+      }
+      url = data?.["@odata.nextLink"] || null;
+    }
+  }
+  return items;
+}
+
+// Upload one local file. Small: single PUT with conflictBehavior on the URL.
+// Large: an upload session, streamed one chunk at a time (never the whole file
+// in memory). Chunks retry on 429/5xx/network errors (max 3, Retry-After
+// honored up to 60 s); after a network error or a 416 the session is re-GET
+// and the upload resumes from nextExpectedRanges; the session is cancelled on
+// final failure. Refuses when the local file changes size during the upload;
+// verifies the stored quickXorHash against the local one when Graph reports it.
+async function uploadFile(root: string, rel: string, localPath: string, replace: boolean, ifMatch?: string) {
+  const startSize = statSync(localPath).size;
+  const hash = createHash("sha256");
+  const enc = encPath(rel);
+  const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
+  if (ifMatch) headers["If-Match"] = ifMatch;
+
+  const checkStoredHash = (item: any) => {
+    const remoteQxh = item?.file?.hashes?.quickXorHash;
+    if (remoteQxh && remoteQxh !== quickXorHashOf(localPath)) {
+      err(`Uploaded quickXorHash mismatch for "${rel}"; the upload did not round-trip`, "UPLOAD_HASH_MISMATCH");
+    }
+  };
+
+  if (startSize <= UPLOAD_SESSION_THRESHOLD) {
+    const data = readFileSync(localPath);
+    if (data.length !== startSize) err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
+    hash.update(data);
+    const res = await checkRaw(
+      await graphRawRequest(`${root}:/${enc}:/content?@microsoft.graph.conflictBehavior=${replace ? "replace" : "fail"}`, {
+        method: "PUT",
+        headers,
+        body: data,
+      }),
+      rel
+    );
+    const item = await res.json();
+    checkStoredHash(item);
+    return {
+      id: item.id,
+      size: startSize,
+      sha256: hash.digest("hex"),
+      mode: "simple",
+      eTag: item.eTag,
+      qxh: item.file?.hashes?.quickXorHash,
+      cTag: item.cTag,
+    };
+  }
+
+  const sessionHeaders: Record<string, string> = {};
+  if (ifMatch) sessionHeaders["If-Match"] = ifMatch;
+  const session = await graphRequest(`${root}:/${enc}:/createUploadSession`, {
+    method: "POST",
+    headers: sessionHeaders,
+    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": replace ? "replace" : "fail" } }),
+  });
+  const uploadUrl = session?.uploadUrl;
+  if (!uploadUrl) err("Graph returned no upload URL for the session", "UPLOAD_SESSION_FAILED");
+
+  const cancelSession = async () => {
+    try {
+      await graphRawRequest(uploadUrl, { method: "DELETE" });
+    } catch {
+      // cancelling is best effort
+    }
+  };
+
+  // Ask the session where to continue: nextExpectedRanges after a network
+  // error or a 416; the drive item once everything is received.
+  const sessionStatus = async (): Promise<{ resume: number | null; item: any | null }> => {
+    const res = await graphRawRequest(uploadUrl, { method: "GET" });
+    if (!res.ok) return { resume: null, item: null };
+    const data = await res.json();
+    if (data?.id) return { resume: null, item: data };
+    const range = String(data?.nextExpectedRanges?.[0] || "").replace(/^bytes\s+/, "");
+    const from = parseInt(range.split("-")[0], 10);
+    return { resume: isNaN(from) ? null : from, item: null };
+  };
+
+  // sha256 is computed in one full pass up front: resumes can skip or repeat
+  // bytes, so hashing per chunk would corrupt the digest.
+  let item: any = null;
+  let start = 0;
+  upload: while (start < startSize) {
+    const end = Math.min(start + UPLOAD_CHUNK_SIZE, startSize) - 1;
+    const len = end - start + 1;
+    const buf = Buffer.alloc(len);
+    const fd = openSync(localPath, "r");
+    let nRead = 0;
+    try {
+      nRead = readSync(fd, buf, 0, len, start);
+    } finally {
+      closeSync(fd);
+    }
+    if (nRead !== len || statSync(localPath).size !== startSize) {
+      await cancelSession();
+      err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
+    }
+    const chunk = nRead === buf.length ? buf : buf.subarray(0, nRead);
+
+    let attempt = 0;
+    for (;;) {
+      let chunkRes: Response;
+      try {
+        chunkRes = await graphRawRequest(uploadUrl, {
+          method: "PUT",
+          headers: {
+            "Content-Length": String(chunk.length),
+            "Content-Range": `bytes ${start}-${start + chunk.length - 1}/${startSize}`,
+          },
+          body: chunk,
+        });
+      } catch (e: any) {
+        // A network error (fetch rejects) retries like a 5xx: re-GET the
+        // session and resume from nextExpectedRanges (416-safe).
+        attempt++;
+        if (attempt > 3) {
+          await cancelSession();
+          throw new GraphError(0, `Network error on chunk ${start}-${start + chunk.length - 1} after 3 retries: ${e?.message || e}`);
+        }
+        await sleep(retryDelayMs(null, attempt));
+        const status = await sessionStatus();
+        if (status.item) {
+          item = status.item;
+          break upload;
+        }
+        if (status.resume != null && status.resume >= startSize) {
+          start = startSize;
+          break upload;
+        }
+        if (status.resume != null && status.resume !== start) {
+          start = status.resume;
+          continue upload;
+        }
+        continue; // nothing received yet: resend the same chunk
+      }
+      if (chunkRes.status === 416) {
+        // The session has different bytes than we sent: resync, never blind-retry.
+        const status = await sessionStatus();
+        if (status.item) {
+          item = status.item;
+          break upload;
+        }
+        if (status.resume != null && status.resume < startSize) {
+          start = status.resume;
+          continue upload;
+        }
+        await cancelSession();
+        err(`Chunk upload out of sync (416) for "${rel}"`, "UPLOAD_OUT_OF_SYNC");
+      }
+      if (chunkRes.ok) {
+        const text = await chunkRes.text();
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed.id) item = parsed; // the final chunk returns the drive item
+          } catch {
+            // 202 progress responses are JSON, but never fail the upload over parsing
+          }
+        }
+        start = start + chunk.length;
+        break;
+      }
+      const retryAfter = chunkRes.headers.get("Retry-After");
+      const body = await chunkRes.text();
+      const retryable = chunkRes.status === 429 || chunkRes.status >= 500;
+      if (retryable && attempt < 3) {
+        attempt++;
+        await sleep(retryDelayMs(retryAfter, attempt));
+        continue;
+      }
+      await cancelSession();
+      throw new GraphError(
+        chunkRes.status,
+        `Graph API ${chunkRes.status} chunk ${start}-${start + chunk.length - 1} after ${attempt} retries: ${body}`,
+        retryAfter ? parseInt(retryAfter, 10) || 0 : null
+      );
+    }
+  }
+  if (statSync(localPath).size !== startSize) {
+    await cancelSession();
+    err(`Local file "${localPath}" changed during upload`, "LOCAL_FILE_CHANGED");
+  }
+  if (!item) err("Upload finished but Graph returned no drive item", "UPLOAD_INCOMPLETE");
+  checkStoredHash(item);
+  return {
+    id: item.id,
+    size: startSize,
+    sha256: sha256Of(localPath),
+    mode: "session",
+    eTag: item.eTag,
+    qxh: item.file?.hashes?.quickXorHash,
+    cTag: item.cTag,
+  };
+}
+
+// OneDrive for Business and SharePoint return only quickXorHash in
+// file.hashes (sha1Hash is personal OneDrive only), so this is the primary
+// comparison for sync. Streamed off disk; never the whole file in memory.
+function quickXorHashOf(localPath: string): string {
+  const q = new QuickXorHash();
+  const fd = openSync(localPath, "r");
+  try {
+    const buf = Buffer.alloc(65536);
+    for (;;) {
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      q.update(buf.subarray(0, n));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return q.digestBase64();
+}
+
+// OneDrive is case-insensitive: a.txt and A.txt map to one remote item, so
+// uploading both would silently replace one with the other. Refuse both.
+export function detectCaseCollisions(rels: string[]): Set<string> {
+  const seen = new Map<string, string>();
+  const collisions = new Set<string>();
+  for (const rel of rels) {
+    const key = rel.toLowerCase();
+    if (seen.has(key)) {
+      collisions.add(seen.get(key)!);
+      collisions.add(rel);
+    } else {
+      seen.set(key, rel);
+    }
+  }
+  return collisions;
+}
+
+// Per-target sync state: the content markers (quickXorHash and cTag when
+// present) each remote file had at its last successful sync. A remote whose
+// content differs from this changed since then — even when it looks older —
+// so both-sides-edited becomes a conflict. The eTag is deliberately not used:
+// SharePoint bumps it on metadata-only changes.
+function syncStateDir(): string {
+  return process.env.OUTLOOK_SYNC_STATE_DIR || join(homedir(), ".config", "outlook-cli", "sync-state");
+}
+
+function syncStateFile(drive: string, target: string): string {
+  const path = (name: string) => {
+    const h = createHash("sha256").update(`${name}:${target}`).digest("hex").slice(0, 16);
+    return join(syncStateDir(), `${name}-${h}.json`);
+  };
+  const file = path(drive);
+  // State written while --drive shared was called "ricky" stays in use, so earlier
+  // syncs keep their conflict markers.
+  if (drive === "shared" && !existsSync(file)) {
+    const legacy = path("ricky");
+    if (existsSync(legacy)) return legacy;
+  }
+  return file;
+}
+
+type SyncStateEntry = { qxh?: string; cTag?: string; syncedAt?: string };
+
+function readSyncState(file: string): Record<string, SyncStateEntry> {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeSyncState(file: string, state: Record<string, SyncStateEntry>): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+}
+
+export function registerFiles(program: Command) {
+  const files = program.command("files").description("OneDrive and SharePoint files (read and upload)");
+
+  files
+    .command("search")
+    .description("Search files and folders in a drive")
+    .argument("<query>", "Search text")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .action(async (query, opts) => {
+      try {
+        const d = await resolveDrive(opts.drive);
+        const sq = encodeURIComponent(query.replace(/'/g, "''"));
+        // Follow @odata.nextLink so large result sets are not cut off.
+        const results: any[] = [];
+        let url: string | null = `${d.searchBase}/search(q='${sq}')?$top=50`;
+        for (let hops = 0; url && hops < 20; hops++) {
+          const data = await graphRequest(url);
+          results.push(...(data?.value || []));
+          url = data?.["@odata.nextLink"] || null;
+        }
+        out({ query, drive: opts.drive, count: results.length, results: results.map((i) => slim(i, d.prefix)) });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("ls")
+    .description("List a folder (paths are relative to the drive root)")
+    .argument("<path>", "Folder path, e.g. 10_Products or /")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .action(async (p, opts) => {
+      try {
+        const d = await resolveDrive(opts.drive);
+        const isRoot = p === "/" || p.trim() === "";
+        const enc = isRoot ? "" : encPath(p);
+        const select = "$select=name,id,size,folder,file,lastModifiedDateTime,parentReference,webUrl";
+        // Follow @odata.nextLink so folders over the page size are complete.
+        const items: any[] = [];
+        let url: string | null = enc
+          ? `${d.root}:/${enc}:/children?${select}`
+          : `${d.root}/children?${select}`;
+        for (let hops = 0; url && hops < 50; hops++) {
+          const data = await graphRequest(url);
+          items.push(...(data?.value || []));
+          url = data?.["@odata.nextLink"] || null;
+        }
+        out({ drive: opts.drive, path: p, count: items.length, items: items.map((i) => slim(i, d.prefix)) });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("info")
+    .description("Show one item's metadata (no file contents)")
+    .argument("<path>", "File or folder path")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .action(async (p, opts) => {
+      try {
+        const d = await resolveDrive(opts.drive);
+        const item = await graphRequest(itemPath(d.root, p));
+        out({ drive: opts.drive, ...slim(item, d.prefix) });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("get")
+    .description("Download a file to the local cache (streams to disk, never loads it whole in memory)")
+    .argument("<path>", "File path relative to the drive root")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .option("--out <dir>", "Cache root directory", DEFAULT_CACHE)
+    .action(async (p, opts) => {
+      try {
+        const { root } = await resolveDrive(opts.drive);
+        const enc = encPath(p);
+        if (!enc) err("Give a file path, e.g. 10_Products/notes.txt", "BAD_PATH");
+        const meta = await graphRequest(`${root}:/${enc}`);
+        if (meta.folder) err("That path is a folder; `files get` works on files only", "IS_FOLDER");
+
+        const cacheRoot = resolvePath(expandTilde(opts.out));
+        mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+        // The cache root itself is the user's choice: resolve it once through
+        // any symlinks. Every level below it must be symlink-free.
+        const realRoot = realpathSync(cacheRoot);
+        const driveRoot = join(realRoot, opts.drive);
+        const target = join(driveRoot, ...p.split("/"));
+        let cur = driveRoot;
+        for (const seg of relative(driveRoot, dirname(target)).split(sep).filter(Boolean)) {
+          cur = join(cur, seg);
+          if (existsSync(cur)) {
+            if (lstatSync(cur).isSymbolicLink()) err(`Refusing to follow the symlink at ${cur}`, "PATH_ESCAPE");
+            if (!statSync(cur).isDirectory()) err(`Not a folder: ${cur}`, "PATH_ESCAPE");
+          }
+        }
+        if (existsSync(target) && lstatSync(target).isSymbolicLink()) err(`Refusing to follow the symlink at ${target}`, "PATH_ESCAPE");
+
+        const res = await checkRaw(await graphRawRequest(`${root}:/${enc}:/content`), p);
+        mkdirChmodChain(realRoot, dirname(target));
+        if (!realpathSync(dirname(target)).startsWith(realRoot + sep)) err("Resolved path escapes the cache directory", "PATH_ESCAPE");
+
+        // Write to a temp file first, verify, then rename: a failed download
+        // never leaves a partial file behind that looks complete.
+        const tmp = join(dirname(target), `.${basename(target)}.part-${process.pid}-${Date.now()}`);
+        const hash = createHash("sha256");
+        let size = 0;
+        try {
+          await pipeline(
+            Readable.fromWeb(res.body as any),
+            async function* (source) {
+              for await (const chunk of source) {
+                hash.update(chunk);
+                size += chunk.length;
+                yield chunk;
+              }
+            },
+            createWriteStream(tmp, { flags: "wx", mode: 0o600 })
+          );
+          chmodSync(tmp, 0o600);
+          if (meta.size != null && size !== meta.size) {
+            throw new GraphError(0, `Downloaded ${size} bytes but Graph says the file is ${meta.size}`);
+          }
+          const remoteQxh = meta.file?.hashes?.quickXorHash;
+          if (remoteQxh && quickXorHashOf(tmp) !== remoteQxh) {
+            throw new GraphError(0, "Downloaded quickXorHash does not match the remote item");
+          }
+          renameSync(tmp, target);
+        } catch (e) {
+          try {
+            unlinkSync(tmp);
+          } catch {
+            // nothing to clean up
+          }
+          throw e;
+        }
+
+        out({ drive: opts.drive, path: p, localPath: target, size, sha256: hash.digest("hex") });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("put")
+    .description(
+      "Upload a local file. Never deletes or moves anything; refuses to overwrite without --force (files only, never a folder)."
+    )
+    .argument("<local>", "Local file path")
+    .argument("<path>", "Remote path relative to the drive root")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .option("--force", "Replace the remote file if it exists (never replaces a folder)")
+    .option("--mkdir", "Create missing parent folders")
+    .action(async (local, p, opts) => {
+      try {
+        const { root } = await resolveDrive(opts.drive);
+        const enc = encPath(p);
+        if (!enc) err("Give a remote path, e.g. 10_Products/notes.txt", "BAD_PATH");
+        const localPath = resolvePath(expandTilde(local));
+        if (!existsSync(localPath) || !statSync(localPath).isFile()) err(`No local file: ${localPath}`, "LOCAL_MISSING");
+
+        const segments = p.split("/").filter(Boolean);
+        if (segments.length > 1) {
+          const dir = segments.slice(0, -1);
+          try {
+            await graphRequest(itemPath(root, dir.join("/")));
+          } catch (e: any) {
+            if (!isNotFound(e)) throw e;
+            if (!opts.mkdir) err(`Remote folder "${dir.join("/")}" does not exist; pass --mkdir to create it`, "PARENT_MISSING");
+            await ensureFolder(root, dir);
+          }
+        }
+
+        // Exists? Without --force: refuse. With --force: replace files only,
+        // never a folder (conflictBehavior=replace on a file below).
+        let replace = false;
+        try {
+          const existing = await graphRequest(itemPath(root, p));
+          if (existing.folder) err(`Remote path "${p}" is a folder; put only replaces files`, "IS_FOLDER");
+          if (!opts.force) err(`"${p}" already exists; pass --force to replace the file`, "ALREADY_EXISTS");
+          replace = true;
+        } catch (e: any) {
+          if (!isNotFound(e)) throw e;
+        }
+
+        const r = await uploadFile(root, p, localPath, replace);
+        out({ drive: opts.drive, path: p, localPath, size: r.size, sha256: r.sha256, id: r.id, uploadedVia: r.mode, replaced: replace });
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+
+  files
+    .command("sync")
+    .description(
+      "Mirror a local folder into the drive: uploads only new or changed files (size + quickXorHash compared against Graph, sha1 fallback). Never deletes remote files."
+    )
+    .argument("<dir>", "Local folder to upload")
+    .argument("<path>", "Remote target folder relative to the drive root")
+    .option("--drive <drive>", DRIVE_HELP, canonicalDrive, "me")
+    .option("--dry-run", "Show the upload plan without uploading")
+    .option("--apply", "Upload the new or changed files")
+    .action(async (dir, p, opts) => {
+      try {
+        if (!!opts.dryRun === !!opts.apply) err("Give exactly one of --dry-run or --apply", "BAD_MODE");
+        const { root } = await resolveDrive(opts.drive);
+        const localDir = resolvePath(expandTilde(dir));
+        if (!existsSync(localDir) || !statSync(localDir).isDirectory()) err(`No local folder: ${localDir}`, "LOCAL_MISSING");
+        // Validate the remote target the same way as every other subcommand.
+        // One leading and one trailing "/" are allowed and stripped; "/" is the drive root.
+        const rootTarget = normalizeRel(p) === "";
+        const normalizedTarget = rootTarget ? "/" : normalizeRel(p);
+        if (!rootTarget) encPath(normalizedTarget); // throws BAD_PATH on dot/backslash/control segments
+
+        const stateFile = syncStateFile(opts.drive, normalizedTarget);
+        const state = readSyncState(stateFile);
+
+        const localFiles: string[] = [];
+        const skippedEntries: any[] = [];
+        (function walk(d: string, rel: string) {
+          for (const e of readdirSync(join(d, rel), { withFileTypes: true })) {
+            if (e.name === ".DS_Store") continue;
+            const r = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) walk(d, r);
+            else if (e.isFile()) localFiles.push(r);
+            else skippedEntries.push({ file: r, skipped: e.isSymbolicLink() ? "symlink" : "special file" });
+          }
+        })(localDir, "");
+        localFiles.sort();
+
+        // Case-only name collisions (OneDrive is case-insensitive; APFS cannot
+        // hold both spellings, so this catches them before anything uploads).
+        const caseCollisions = detectCaseCollisions(localFiles);
+
+        const remoteDirs = new Set<string>();
+        for (const rel of localFiles) {
+          const segs = (rootTarget ? rel : `${normalizedTarget}/${rel}`).split("/");
+          for (let i = 1; i < segs.length; i++) remoteDirs.add(remoteKey(segs.slice(0, i).join("/")));
+        }
+        const remoteTree = await listRemoteTree(root, rootTarget ? "" : normalizedTarget, (rel) => remoteDirs.has(remoteKey(rel)));
+        const plan: any[] = [];
+        let unchanged = 0;
+        for (const rel of localFiles) {
+          const remoteRel = rootTarget ? rel : `${normalizedTarget}/${rel}`;
+          // One bad local file name (a backslash or control character is legal
+          // on macOS) is skipped and reported, not an abort of the whole sync.
+          const badName = badSegmentReason(remoteRel) || oneDriveNameProblem(remoteRel);
+          if (badName) {
+            plan.push({ file: rel, remote: remoteRel, skipped: `bad file name: ${badName}` });
+            continue;
+          }
+          const st = statSync(join(localDir, rel));
+          if (caseCollisions.has(rel)) {
+            plan.push({ file: rel, remote: remoteRel, conflict: "case-only name collision with another local file; upload refused" });
+            continue;
+          }
+          const remote: any = remoteTree.get(remoteKey(remoteRel)) || null;
+          if (remote?.folder) {
+            plan.push({ file: rel, remote: remoteRel, skipped: "remote path is a folder; never replaced" });
+            continue;
+          }
+          // OneDrive for Business/SharePoint give quickXorHash only; personal
+          // OneDrive also has sha1Hash. Prefer quickXorHash, fall back to sha1;
+          // a remote item with neither hash counts as changed (re-upload).
+          const hashes = remote?.file?.hashes || {};
+          let hashMatches = false;
+          if (hashes.quickXorHash) hashMatches = quickXorHashOf(join(localDir, rel)) === hashes.quickXorHash;
+          else if (hashes.sha1Hash) hashMatches = sha1Of(join(localDir, rel)) === String(hashes.sha1Hash).toUpperCase();
+          const same = remote && remote.size === st.size && hashMatches;
+          if (same) {
+            unchanged++;
+            // Identical content: record the remote's content markers as the
+            // last-synced ones (apply only; dry-run never writes state).
+            if (opts.apply) state[remoteRel] = { qxh: hashes.quickXorHash || undefined, cTag: remote.cTag, syncedAt: new Date().toISOString() };
+            continue;
+          }
+          const times = {
+            remoteModified: remote?.lastModifiedDateTime || null,
+            localModified: st.mtime.toISOString(),
+          };
+          if (!remote) {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, changed: false, ...times });
+            continue;
+          }
+          // Both-sides-edited guard, content-based: a remote whose quickXorHash
+          // differs from the one recorded at the last sync has different bytes
+          // than what we uploaded, even when it looks older. cTag is the
+          // fallback (SharePoint bumps eTag on metadata-only changes, so the
+          // eTag itself is never the signal). First sync with no stored state
+          // falls back to the mtime rule.
+          const remoteQxh = hashes.quickXorHash || null;
+          const stored = state[remoteRel];
+          const contentChangedSinceSync =
+            (stored?.qxh && remoteQxh && stored.qxh !== remoteQxh) ||
+            (!remoteQxh && !!stored?.cTag && !!remote?.cTag && stored.cTag !== remote.cTag);
+          if (contentChangedSinceSync) {
+            plan.push({
+              file: rel,
+              remote: remoteRel,
+              size: st.size,
+              conflict: "remote content changed since the last sync; both sides may be edited",
+              ...times,
+            });
+            continue;
+          }
+          // A changed remote file is only replaced when the remote copy is
+          // older than the local one; a remote edit newer than local is a
+          // conflict that sync never overwrites.
+          const remoteNewer = remote.lastModifiedDateTime && new Date(remote.lastModifiedDateTime) > st.mtime;
+          if (remoteNewer) {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, conflict: "remote is newer than the local file", ...times });
+          } else {
+            plan.push({ file: rel, remote: remoteRel, size: st.size, changed: true, eTag: remote.eTag, ...times });
+          }
+        }
+
+        for (const s of skippedEntries) plan.push(s);
+        const toUpload = plan.filter((u) => !u.skipped && !u.conflict && (u.changed || u.eTag === undefined));
+        if (opts.apply) {
+          try {
+            await graphRequest(itemPath(root, normalizedTarget));
+          } catch (e: any) {
+            if (!isNotFound(e)) throw e;
+            await ensureFolder(root, normalizedTarget.split("/").filter(Boolean));
+          }
+          for (const u of toUpload) {
+            const relSegments = u.remote.split("/").filter(Boolean);
+            const dir = relSegments.slice(0, -1);
+            if (dir.length) {
+              try {
+                await graphRequest(itemPath(root, dir.join("/")));
+              } catch (e: any) {
+                if (!isNotFound(e)) throw e;
+                await ensureFolder(root, dir);
+              }
+            }
+            try {
+              // Replace only files we saw older remotes for, and send If-Match
+              // with the eTag from the plan so an item that changed after the
+              // plan fails with 412 instead of overwriting.
+              const r = await uploadFile(root, u.remote, join(localDir, u.file), !!u.changed, u.eTag);
+              u.id = r.id;
+              u.sha256 = r.sha256;
+              u.uploadedVia = r.mode;
+              if (r.qxh || r.cTag) state[u.remote] = { qxh: r.qxh, cTag: r.cTag, syncedAt: new Date().toISOString() };
+            } catch (e: any) {
+              if (e instanceof GraphError && e.status === 412) {
+                u.conflict = "remote changed during upload (412); skipped";
+                continue;
+              }
+              throw e;
+            }
+          }
+        }
+
+        out({
+          drive: opts.drive,
+          localDir,
+          remote: p,
+          mode: opts.apply ? "apply" : "dry-run",
+          scanned: localFiles.length,
+          uploads: toUpload.filter((u) => !u.conflict).length,
+          unchanged,
+          conflicts: plan.filter((u) => u.conflict).length,
+          files: plan,
+        });
+        if (opts.apply) writeSyncState(stateFile, state);
+      } catch (e: any) {
+        graphFail(e);
+      }
+    });
+}
